@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 600 900">
+<!-- Steam library capsule (portrait). -->
+<rect width="600" height="900" fill="#1e1b1b"/>
+<image xlink:href="d2d.svg" x="90" y="120" width="420" height="420"/>
+<image xlink:href="steam-logo.svg" x="40" y="620" width="520" height="72"/>
+</svg>

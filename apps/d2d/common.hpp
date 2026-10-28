@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Shared includes, screen/iso constants, blit helpers.
+#pragma once
+
+#include <font.hpp>
+
+#include "game_api.hpp"
+
+#include <dc6.hpp>
+#include <palette.hpp>
+
+#include <csignal>
+#include <cstdint>
+#include <filesystem>
+#include <string_view>
+#include <vector>
+
+// Set to 1 by d2d_sigint_handler on SIGINT/SIGTERM; polled each frame.
+// Declared at global scope because std::signal handlers must have C
+// linkage. Defined further below.
+extern volatile std::sig_atomic_t g_sigint_quit;
+
+namespace d2d::client {
+
+// D2 LoD 800×600 mode dimensions — matches TitleScreen.DC6, which ships
+// pre-sliced into a 4×3 grid of sub-frames adding up to exactly 800×600
+// (columns 256/256/256/32, rows 256/256/88).
+constexpr std::uint32_t kScreenWidth = 800;
+constexpr std::uint32_t kScreenHeight = 600;
+// Where the camera point (the player's feet) lands on screen, in y: the
+// camera sits at player - H/2 + 16 (FUN_0045b440) and units are drawn
+// 8 below it (FUN_0045afd0), so H/2 - 8. Floors centre on the view less
+// the 40-pixel panel instead (FUN_0045aea0 -> FUN_00476000, read in
+// FUN_0044c990), H/2 - 20 for the camera's cell corner.
+constexpr int kViewY = int(kScreenHeight) / 2 - 8;
+constexpr int kFloorViewY = (int(kScreenHeight) - 40) / 2;
+
+// The height is always kScreenHeight; a widescreen view is a buffer wider
+// than kScreenWidth, so a framebuffer's stride is read from its size.
+// game.exe's text y (FUN_00502320) is the bottom of the font's glyph cell
+// (font6's cells are 11 tall, the baseline on row 8); Font::draw takes the
+// top. The char panel's rule (draw_char_panel), for every panel's text.
+[[nodiscard]] inline int glyph_top(const d2d::font::Font& font, int bottom) {
+    return bottom - (font.sheet().frames_per_direction() > 0 ? int(font.sheet().frame(0, 0).height) : font.line_height()) + 1;
+}
+
+inline auto fb_width(const std::vector<std::uint8_t>& framebuffer) -> int {
+    return int(framebuffer.size() / 4 / kScreenHeight);
+}
+
+// The widest widescreen view (ultra-wide), in logical pixels.
+constexpr int kMaxViewWidth = 1400;
+
+// The in-game view's logical width: kScreenWidth, or wider in widescreen
+// (see main.cpp's resize handling). Read by the world's light grid and rain.
+inline int g_view_width = int(kScreenWidth);
+
+// What the last render_world drew, as game.exe's tile flag 0x20000 (its
+// tile draws, FUN_004de410 / FUN_005130a0). The automap reveals only
+// those, and only for the level they were drawn in (automap.md
+// "Revealing").
+// A tile drawn: its cell in render_world's level grid and where it came
+// from, the Level::Pick or DS1 layer cell (nullptr: all of the cell's).
+struct DrawnCell { int x, y; const void* source; };
+struct Drawn {
+    const Level* level = nullptr;
+    int panel_side = 0;                         // Automap::panel_side: a wall draws only in the other half (FUN_005130a0)
+    std::vector<DrawnCell> cells;
+};
+inline Drawn g_drawn;
+
+// Dev overlay toggled by devctl `debug collision`: blocked subtiles in red.
+inline bool g_debug_collision = false;
+
+// Palette-lookup blit: index 0 is transparent (skip), all other indices map
+// through the supplied palette to real RGBA. Signed dest so negative offsets
+// clip cleanly (logo frames have ox down to -180).
+// `shade` scales the colour, 256 = as is (skill tree: greyed-out icons).
+// `base` coloured `rgb`: each entry's brightness times the colour (a co-op
+// player's cursor).
+[[nodiscard]] d2d::palette::Palette tinted(const d2d::palette::Palette& base, std::uint8_t red, std::uint8_t green, std::uint8_t blue);
+
+void blit_sprite(std::vector<std::uint8_t>& framebuffer,
+                 const d2d::dc6::Frame& frame,
+                 const d2d::palette::Palette& pal,
+                 int dst_x, int dst_y, int shade = 256);
+
+// Blit a frame at anchor+(frame.offset_x, frame.offset_y - height + 1).
+// D2 convention is BOTTOM-LEFT origin.
+// unverified (source: OpenDiablo2 dcc_direction_frame.go, `box.top =
+// y_offset - height + 1`): the anchor; the data agrees — the fire
+// animation's oy=132 is constant across frames of varying height, so
+// anchoring the bottom keeps the fire's base planted while its flame
+// flickers.
+void blit_at_anchor(std::vector<std::uint8_t>& framebuffer,
+                    const d2d::dc6::Frame& frame,
+                    const d2d::palette::Palette& pal,
+                    int anchor_x, int anchor_y);
+
+// Additive blit — D2's fire assets are drawn with TRANS_ADDITIVE. When a
+// PL2 is available we resolve through Blizzard's authored
+// MaxComponentBlend[fg][bg] table, which returns the palette index
+// Blizzard picked for that combination (palette-preserving, exact match
+// against the original renderer). Falls back to plain RGB-clamp additive
+// when the caller has only a plain Palette — used by the credits path
+// which doesn't need PL2 fidelity.
+//
+// Reading back the framebuffer to a palette index would require an RGB->
+// index reverse lookup we don't have; instead the PL2 path samples the
+// UNMODIFIED-so-far fg color for the src and treats the current fb pixel
+// as bg by finding its closest palette index. To keep it fast and avoid a
+// KD-tree, we short-circuit the common case: when bg is black (index 0,
+// i.e. the fb has not been written since the last clear), additive(fg, 0)
+// == fg — so we just plot pal[fg]. Otherwise fall back to RGB-clamp add.
+// The fire is drawn early in the frame over the char-create bg (which is
+// dark/near-black in the campfire pit), so this covers > 95% of pixels.
+void blit_additive(std::vector<std::uint8_t>& framebuffer,
+                   const d2d::dc6::Frame& frame,
+                   const d2d::palette::Palette& pal,
+                   const d2d::palette::Pl2* pl2,
+                   int anchor_x, int anchor_y);
+
+void paint_test_pattern(std::vector<std::uint8_t>& framebuffer);
+
+// A DC6 background is often stored as a grid of sub-frames arranged
+// left-to-right, top-to-bottom (D2 splits large images because DC6 frames
+// each cap at 256×256 in practice). This lays them out side by side.
+void blit_dc6_grid(std::vector<std::uint8_t>& framebuffer,
+                   const d2d::dc6::Sprite& spr,
+                   const d2d::palette::Palette& pal,
+                   int origin_x, int origin_y,
+                   int tiles_across);
+
+// D2's base game/anim tick is 25 Hz — every animation rate in AnimData.d2
+// is `25 * animRate / 256`. The frontend menu runs at that base rate;
+// tying our advance to wall-clock ms keeps playback correct regardless of
+// how fast we happen to be rendering (60 Hz, 120 Hz, headless, whatever).
+constexpr std::uint32_t kBaseFrameMs = 40;   // 1000 / 25
+
+}  // namespace d2d::client

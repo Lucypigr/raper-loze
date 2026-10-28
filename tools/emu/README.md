@@ -1,0 +1,199 @@
+# emu: game.exe as the ground truth
+
+Runs game.exe's own code (1.14d) in an emulator, so d2d's version of a
+function can be checked against the real one. No Windows or wine needed.
+
+## Run it
+
+```sh
+cd tools/emu
+uv sync                                   # once
+uv run python diff_drlg.py 1-20 2         # d2d's Blood Moor vs game.exe's, map seeds 1..20
+```
+
+Good: `level 2: 20/20 seeds match game.exe`.
+
+## Why it exists
+
+- d2d must match game.exe exactly (levels, drops, monster AI, ...).
+  Reading decompiled code gets close; running the real code proves it.
+- The dump oracles (levels, drops, objects) print game.exe's answer in
+  the same text form a small d2d tool prints, so a plain diff finds the
+  first difference. The AI checks (sight.py, search.py, moves.py,
+  missiles.py) compare against line-for-line copies in-process and print
+  `ok`.
+
+## The checks you'll use most
+
+| Checks | Command (in tools/emu) | Good output |
+|---|---|---|
+| Level layouts, monsters, objects | `uv run python diff_drlg.py 1-20 2 [tiles\|monsters\|objgroups\|collision\|game\|npcs]` | `N/N seeds match game.exe` |
+| Every level, all cores | `./sweep.sh 1-50 monsters objgroups` | every level matching |
+| Every level's collision vs libd2's engine captures (200 seeds × 3 difficulties, ~8 min) | `D2_BUILD=build-release uv run python libd2_crc.py` | `N/131 levels match on all 200 seeds` |
+| Item drops | `uv run python drops.py 1-20000` (also `tables`, `items`, `objects`, `stands`) | `N/N ... match game.exe` |
+| Monster sight, search, moves | `uv run python sight.py 20000 3`, `search.py 20000 2`, `moves.py` | `ok` |
+| Missiles | `uv run python missiles.py 1500 7` | `ok` |
+| Missile frame directions | `uv run python missile_dirs.py 2000 > g.txt; cut -d: -f1 g.txt \| ../../build/tools/missile-dir-dump/missile-dir-dump \| diff g.txt -` (also `table`) | no output |
+| Walk / run animation rate | `uv run python walk_rates.py > g.txt; ../../build/tests/test_combat --walk-rates \| diff g.txt -` | no output |
+| Skill tooltip lines | `uv run python skill_tips.py 20 0 > g.txt; ../../build/tests/test_game --skill-tips 20 0 \| grep '^[0-9]' \| iconv -f latin1 -t utf-8 \| diff g.txt -` | no output |
+| Key bindings (assign rules, key names) | `uv run python keys.py \| diff - <(../../build/tests/test_keyconfig --dump)` | no output |
+
+## When it breaks
+
+| You see | Fix |
+|---|---|
+| `SystemExit` naming an import | game.exe called a Win32 function nobody stubbed: add a `w_<ImportName>` method to `emu.py` |
+| Can't find game.exe or the MPQs | Set `D2_MPQ_DIR`, or run the launcher once (it writes `data =` and puts `bin/game.exe` beside the MPQs) |
+| `mpq-cat` not found | Build first: `cmake --build build` |
+| 1.14d tables missing | Set `D2_PATCH_INSTALLER=/path/to/LODPatch_114d.exe` |
+| First run is slow | Normal: files are cached in `.cache/` after that |
+
+The rest of this page is the reference for every oracle and for adding
+your own.
+
+## Setup
+
+```
+cd tools/emu
+uv sync                      # .venv with unicorn, pefile, capstone
+```
+
+Needs `bin/game.exe` beside the MPQs (the launcher puts it there) and a
+built `build/tools/mpq-cat/mpq-cat`. The MPQ folder is found as d2d finds
+it: `$D2_MPQ_DIR`, else `data =` in d2d.cfg (`~/.config/d2d/` on Linux,
+`~/Library/Preferences/d2d/` on macOS), else the macOS launcher's setting.
+The 1.14d patch data comes from `$D2_PATCH_INSTALLER`, which defaults to
+`~/Downloads/Diablo II + LoD/patch/LODPatch_114d.exe`.
+
+## What's there
+
+- `emu.py`: the core `Emu` class.
+  - `call(addr, *stack_args, ecx=, edx=)` calls a function. It covers
+    stdcall, fastcall and cdecl (the caller pops nothing). It returns EAX.
+  - `hook(addr, fn, nstack)` replaces a game.exe function with Python.
+  - `alloc`/`put`/`r32`/`s32`/`w32`/`read`/`cstr` handle memory. The heap
+    is a bump allocator that never frees.
+  - `crt_init()` runs the static CRT's heap and thread-data startup. It
+    also hooks the fatal-error handler (0x408a60, which raises
+    `SystemExit` with the message) and the string-table lookup
+    (0x524d30, which returns `""`).
+  - `serve_files(e)` answers Storm's file calls (open, size, read, seek,
+    close, name) from the MPQ stack through `mpq-cat`. Files are cached
+    in `.cache/`, so the first run is slow and later runs are fast.
+  - Win32 stubs are `w_<ImportName>` methods that return
+    `(eax, stdcall arg count)`. An unstubbed import stops the run with its
+    name and a stack of return addresses, so you add them as you go.
+  - `backtrace()` scans the stack for code addresses. It's a heuristic,
+    not an unwind.
+- `mpq_cache.py` caches MPQ reads by archive and patch version. A tool
+  error stops the oracle; only a confirmed absent archive entry is cached.
+- `python3 -m unittest test_tooling.py` checks cache recovery and sweep
+  failure reporting without game data.
+- `drops.py`: the drop roller (FUN_0055a6d0) as an oracle. It diffs
+  `build/tools/drop-dump` over a seed range (`drops.py 1-100000`), or
+  every treasure class's entries (`drops.py tables`), made items
+  (`drops.py items`), containers opened (`drops.py objects`) and armor
+  stands' / weapon racks' items (`drops.py stands`). Item creation is
+  hooked, so only the dropper's seed moves. See
+  `docs/research/re/drops.md`.
+- `drlg.py`: the level generator as an oracle.
+  - `boot()` loads every data table (FUN_00619300(0, 1, 1), about 1.4 s
+    warm), including the LvlPrest and LvlSub DS1s.
+  - `alloc_act(e, act, seed, level)` is FUN_006194a0, server side. It
+    builds `level` straight away.
+  - `dump()` prints a level in the same text form as
+    `build/tools/drlg-dump/drlg-dump`.
+
+```
+uv run python drlg.py 3              # the Blood Moor for map seed 3
+uv run python drlg.py 1-300 2 out/   # out/<seed>.txt for seeds 1..300
+```
+
+Diff it against the port:
+
+```
+build/tools/drlg-dump/drlg-dump ~/Workspace/private/diablo2 3 > ours.txt
+(cd tools/emu && uv run python drlg.py 3) > game.txt && diff game.txt ours.txt
+```
+
+- `objgroups.py`: each room's preset units and random object groups
+  (FUN_005559a0, FUN_00552610) as an oracle: the room seed in and out,
+  the object seed, and every object made. The regression check for
+  `components/game/objgroups.cpp`, which should report every seed matching
+  for every Act 1 level:
+
+```
+uv run python diff_drlg.py 1-20 2 objgroups     # level 2..39
+uv run python diff_drlg.py 1-20 2 drops         # then three items dropped at each group object (FUN_00555da0)
+./sweep.sh 1-50 monsters objgroups              # every level 2..39, a job per core but two (JOBS=n); progress on stderr
+```
+
+`sweep.sh` exits 2 on bad input (seeds not FIRST-LAST or with a leading
+zero, an unknown kind, JOBS not a positive integer) and 1 when any level
+fails, mismatches or reports fewer results than asked.
+
+- `monprop_rows.py`: the MonProp rows as game.exe compiled them
+  (DataTables +0xc30), per row its MonStats users and each difficulty's
+  {prop, par, min, max, chance} slots; test_game's MonProp cases are its
+  output.
+- `sight.py`: a monster's line of sight (FUN_00622920 → FUN_0064e260)
+  on random walls in a fake room, against a line-for-line Python copy of
+  `rules::sight_blocked`. `uv run python sight.py 20000 3` should print
+  `ok`. See `docs/research/re/monster-ai.md`.
+- `search.py`: a monster's target search (FUN_005dd7f0) on random players
+  with pets, good and neutral monsters in lists 8 / 9, rooms for the mode 5
+  search, and Attract's / Confuse's skill-set target (FUN_005dd610), against
+  `rules::search_pick` / `search_near` and ai.cpp's flow.
+  `uv run python search.py 20000 2` should print `ok`; `--break` should not.
+- `moves.py`: a monster's move. The toward pather (FUN_00679c80) runs on
+  random walls, and the chase check (FUN_006503f0 → FUN_00650350: stop,
+  go on, re-path, the budget) runs on random paths and targets. Both are
+  compared against line-for-line copies of `rules::toward_path` /
+  `rules::chase_check`, and the modes that think at once (DAT_0073c6d0)
+  against ai.cpp's. `uv run python moves.py` should print `ok` three times.
+  `--break` breaks the copy and should print mismatches; `--dump` prints the
+  test_monsters.cpp cases.
+- `collision` (drlg.py `collision_dump`): the level's rooms brought up out
+  of list order ($ORDER shuffle, the default, reverse or list), then every
+  room's collision grid (room1 +0x20), against `relevel`'s:
+  `uv run python diff_drlg.py 1-10 2 collision`, `./sweep.sh 1-10 collision`.
+- `game` (objgroups.py `game_dump`): one game, $LEVELS (default 2,8,4,9;
+  put 1 first for the camp, whose rooms print without their seeds) made in turn, each level's rooms brought up in $ORDER and populated newest
+  first, then every container they made opened (drops.py's openers): per
+  room the room1 seed, the room seed, the object and game seeds, the objects
+  made; per container its drops and the seeds after. The check for the one
+  object seed and the room order: `uv run python diff_drlg.py 1-20 0 game`.
+- `units` brings game.exe's rooms up in $ORDER first (drlg.py `bring_up`):
+  the units and warps come out the same in any order.
+- `layout` (drlg.py `layout_dump`): act 2's outdoor rectangles, Lut
+  Gholein's LvlPrest file and the two tombs, nothing built:
+  `uv run python diff_drlg.py 1-2000 40 layout`. Every dump builds a level
+  in its own act (`act_of`).
+
+## Adding a new oracle
+
+1. Find the entry point and its calling convention with Ghidra.
+   `Disasm.java` shows the register args the decompiler drops (see
+   `tools/ghidra/README.md`).
+2. Call it with `boot()`-style setup, then read the result structs back
+   (offsets go in the RE doc).
+3. When it faults, the message names the eip and the stack. Stub the
+   import, or `hook` the function if it reaches outside what you're testing
+   (UI, network, sound).
+4. Print the result in a text form that a small C++ tool beside the port
+   also prints, then diff.
+
+ponytail: `__cinit` (C++ static constructors) isn't run, because its C
+initialisers want locale setup. Add it when a global constructor turns out
+to matter.
+
+- `missiles.py`: missile flights (FUN_0059fa30, then srvdofunc 1 a frame at
+  a time) in a Blood Moor game, against a line-for-line copy of
+  `rules::MissileFlight`: every frame's 16.16 position and how it ended
+  (range, wall / rooms, the foe struck). `uv run python missiles.py 1500 7`
+  should print `ok`; `--break` should not; `--dump` prints the
+  test_monsters.cpp cases. See `docs/research/re/missiles.md`.
+- `npcs.py`: the camp's NPCs thinking (MonAI Npc, FUN_005e7130) with its
+  effects hooked, against `drlg-dump ... npcs` (`rules::npc_think`):
+  `THINKS=150 uv run python diff_drlg.py 1-40 0 npcs`. See
+  `docs/research/re/town-npcs.md`.

@@ -1,0 +1,226 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Menu screens: title, credits, char-select, char-create, cinematics.
+#pragma once
+
+#include "scene.hpp"
+#include "ui.hpp"
+
+#include <d2s.hpp>
+
+#include <array>
+#include <cstdint>
+#include <span>
+#include <string>
+#include <vector>
+
+namespace d2d::client {
+
+void render_title(std::vector<std::uint8_t>& framebuffer,
+                  const Scene& scene,
+                  std::span<const Button> buttons,
+                  std::uint32_t elapsed_ms);
+
+// Character-select screen — RE FUN_004359d0 (init) + FUN_0042ef50 (BG draw).
+// LoD layout: characterselectscreenEXP as BG, 2 columns × 4 rows of
+// character slots; one gold charselectbox (272x93 assembled) marks the pick.
+// Four buttons: CREATE / DELETE (TallButtonBlank, record bottom y=528) and
+// OK / EXIT (MediumButtonBlank, bottom y=572). Char-create's OK/EXIT sit at
+// the same spot but use MediumSelButtonBlank (handle 0x779744), which is
+// authored for the fechar palette — on this Sky screen it speckles.
+//
+// Slots list <user dir>/save/*.d2s; OK enters InGame once one is picked.
+// CREATE hops to CharCreate. DELETE asks first (records 0xd6..0xd9).
+struct CharSelectUI {
+    Button create_btn{};
+    Button convert_btn{};
+    Button delete_btn{};
+    Button cancel_btn{};
+    Button ok_btn{};
+    std::string create_label, create_label2;
+    std::string convert_label, convert_label2;
+    std::string delete_label, delete_label2;
+    std::string cancel_label;
+    std::string ok_label;
+    // A failed join's message in game.exe's OK popup (FUN_00433380); empty
+    // when none is up. OK goes to popup_return.
+    std::string popup;
+    Button popup_ok{};
+    Screen popup_return = Screen::CharSelect;
+    // DELETE's question (FUN at 0x439cc0): PopUpOKCancel2, tbl 0x142b,
+    // NO (0x142f) at x 281 and YES (0x142e, 0x43b6b0 deletes) at x 421.
+    bool confirm_delete = false;
+    std::string delete_text, yes_label, no_label;
+    Button popup_no{}, popup_yes{};
+    // OK on a save past Normal (FUN_00439840 -> FUN_00439780): records 0xac
+    // DifficultyLevels at (237, 400 bottom), 0xab "SELECT DIFFICULTY"
+    // (0x2723) at (264, 260), 0xa8..0xaa NORMAL / NIGHTMARE / HELL
+    // (0x2722..0x2720, WideButtonBlank 272x35, bottoms 297 / 340 / 383,
+    // keys R / N / H; FUN_00439af0 plays at that difficulty); Esc (0xad)
+    // closes it. HELL is greyed until the save may play it.
+    bool pick_difficulty = false;
+    bool hell_open = false;
+    std::string difficulty_heading;
+    std::array<std::string, 3> difficulty_label;
+    std::array<Button, 3> difficulty_btn{};
+    int selected = -1;           // index into Scene::saves, or -1
+    int scroll = 0;              // index of the save in slot 0; always even
+    std::uint32_t last_click_ms = 0;   // double-click = OK (FUN_0043a9d0)
+};
+
+// Largest valid CharSelectUI::scroll for `n` saves: last row at the bottom.
+int charselect_max_scroll(int count);
+
+// D2 font colours used on char-select (FUN_004fc9b0 colour arg).
+constexpr std::uint8_t kTextRed[3]   = { 255, 77, 77 };    // 1
+constexpr std::uint8_t kTextGreen[3] = { 0, 255, 0 };      // 2
+constexpr std::uint8_t kTextGold[3]  = { 199, 179, 119 };  // 4
+
+// Name prefix earned by beating difficulties — FUN_005068a0 picks a tier
+// from the progression byte, FUN_00505640 the (hard-coded English) word.
+// Tier: classic <4/<8/<12/else, LoD <5/<10/<15/else -> 0..3; hardcore
+// shifts non-zero tiers by 3. Female: Amazon, Sorceress, Assassin.
+std::string char_title(const d2d::d2s::Header& header);
+// A class's name (string.tbl's), by the save's class id.
+[[nodiscard]] std::string class_name(const Scene& scene, int save_cls);
+// The save's second char-select line: "Level 12 Barbarian" (string.tbl's words).
+[[nodiscard]] std::string level_class_line(const Scene& scene, const d2d::d2s::Header& header);
+// The title's tier: the difficulties done (0..3), from the save's progression.
+[[nodiscard]] int title_tier(const d2d::d2s::Header& header);
+// The hardest difficulty the save may play (0 normal .. 2 hell).
+[[nodiscard]] inline int top_difficulty(const d2d::d2s::Header& header) { return std::min(title_tier(header), 2); }
+// Whether OK asks for a difficulty first: Nightmare is open (FUN_00439840:
+// progression & 0x1f >= 4 classic, >= 5 LoD; single player or hosting only).
+[[nodiscard]] inline bool asks_difficulty(const d2d::d2s::Header& header) { return top_difficulty(header) >= 1; }
+
+// Visible slot index under (x, y), or -1. Row-major: slot i = row i/2, col i%2.
+int charselect_slot_at(int x, int y);
+
+void render_charselect(std::vector<std::uint8_t>& framebuffer,
+                       const Scene& scene,
+                       const CharSelectUI& select_ui,
+                       std::uint32_t elapsed_ms);
+
+// Full-screen credits background + scrolling text. The scroll starts with
+// the first line off the bottom of the screen and advances upward at ~1 px
+// per D2 tick (25 Hz). When the last line clears the top, the scroll loops.
+void render_credits(std::vector<std::uint8_t>& framebuffer,
+                    const Scene& scene,
+                    std::uint32_t elapsed_ms);
+
+// Character-creation screen — the iconic seven-classes-around-a-campfire
+// scene, loaded by FUN_004326f0. For MVP we blit each class's nu1 (idle)
+// cycle at hardcoded positions matching the D2 layout, plus the fire
+// animation in the pit. Selection / hover / class labels are follow-ups.
+
+// Advance the per-class state machine — completes one-shot animations
+// (Selecting → Selected, Deselecting → Idle) once they finish.
+void advance_char_states(CharCreateUI& create_ui,
+                         const Scene& scene,
+                         std::uint32_t elapsed_ms);
+
+// Hit-test click position against class silhouettes and trigger selection
+// transitions. Only one class is Selected/Selecting at a time; picking a
+// new one first sends the previous into Deselecting.
+// Hardcore-checkbox rect — RE'd char-create master table 0x70b0b0.
+constexpr int kHardcoreX = 319, kHardcoreW = 15, kHardcoreH = 16;
+constexpr int kHardcoreY = rec_top(560, kHardcoreH);
+// The Expansion Character box (record 0xD4, (319, 540), FUN_00430770: status
+// bit 0x20) and its label's hitbox 0xD3 (339, 561, 200 x 32, string 0x58cb).
+constexpr int kExpansionY = rec_top(540, kHardcoreH);
+
+void handle_charcreate_click(CharCreateUI& create_ui,
+                             const Scene& scene,
+                             const Mouse& mouse,
+                             std::uint32_t elapsed_ms);
+
+void render_charcreate(std::vector<std::uint8_t>& framebuffer,
+                       const Scene& scene,
+                       const CharCreateUI& create_ui,
+                       std::uint32_t elapsed_ms);
+
+// Store labels alongside the buttons so we own the string memory through
+// the frame. Called once at startup; string lookups happen only there.
+struct TitleUI {
+    std::vector<Button>     buttons;
+    std::vector<std::string> labels;   // owns text buffers Button.label points into
+};
+
+// Build the main-menu button list. Positions from RE (LoD variant records
+// 0x709010..0x7090a0 + shared bottom row 0x708f80..0x708fe0). Labels sourced
+// from patchstring.tbl by ID (from the +0x18 field of each menu record) —
+// falls back to a plausible English string when the TBL entry is missing.
+// The LoD cinematics screen (FUN_00431600 -> FUN_004313d0): frontend
+// records 8 (title background), 0x3d (CinematicsSelectionEXP panel,
+// bottom-left (237, 505)), 0x3e (the "SELECT CINEMATICS" 0x13fa text box,
+// (262, 153) 272x35), 0x3f..0x45 (WideButtons at x 262, bottoms 181..439,
+// strings 0x5525..0x552b) and 0x46 (CANCEL 0x13ef, MediumButton at
+// (334, 488)). The first `unlocked` entries work; the rest are disabled
+// (FUN_004f96f0). Unlocking follows game.exe's "Aux Battle.net" bits.
+struct CinematicsUI {
+    std::array<Button, 7> entry{};
+    std::array<std::string, 7> labels;
+    Button cancel{};
+    std::string cancel_label, heading;
+    int unlocked = 1;
+};
+// The videos behind the seven entries, in order (handlers 0x434320..).
+constexpr std::array<const char*, 7> kCinematicVideo = {
+    R"(data\local\video\ENG\d2intro640x292.bik)",   R"(data\local\video\ENG\Act02start640x292.bik)",
+    R"(data\local\video\ENG\Act03start640x292.bik)", R"(data\local\video\ENG\Act04start640x292.bik)",
+    R"(data\local\video\ENG\Act04end640x292.bik)",   R"(data\local\video\ENG\D2x_Intro_640x292.bik)",
+    R"(data\local\video\ENG\D2x_Out_640x292.bik)" };
+
+// The classic endgame screen (FUN_0044e770), after ACT04END on leaving the
+// game Diablo died in: ui\menu\endgame on its own palette, two 320x480
+// halves bottom-anchored at (0, 256) (0, H-1) / (W/2, 256) (W/2, H); in
+// font42 gold, centred: 0x13ea at baseline 62, 0x13eb at 107, the name at
+// 187, 0x13ec at 232, the title just earned and the name at 277
+// (FUN_0044d3e0, FUN_0044e5a0); endgameok at (W/2-48, H-80) with 0x13ee in
+// font16 (pressed: 2 left, 2 down). Its click (FUN_0044e4f0) goes on to the
+// main menu.
+// ponytail: classic only; LoD's endgame2 layout is never reached (its end is Tyrael's portal).
+struct EndgameUI {
+    d2d::dc6::Sprite background, ok;
+    d2d::palette::Palette pal;
+    std::array<std::string, 3> lines;
+    std::string name, titled, ok_label;
+    bool pressed = false;
+};
+EndgameUI endgame_ui(const Scene& scene, const d2d::d2s::Header& header);
+// Whether the point is on its OK (FUN_0044e460 / FUN_0044e4f0).
+bool endgame_on_ok(int x, int y);
+void render_endgame(std::vector<std::uint8_t>& framebuffer, const Scene& scene, const EndgameUI& endgame);
+
+// Other Multiplayer (FUN_00430c50, docs/research/re/tcpip-menu.md): the
+// title's background and logo (FUN_0043c4f0) under records 0xff OPEN
+// BATTLE.NET, 0x100 TCP/IP GAME and 0x101 CANCEL. Drawn by render_title.
+TitleUI other_multiplayer_ui(const Scene& scene);
+
+// TCP/IP Options (FUN_0042ffe0) and its join box (FUN_00431d20). main.cpp
+// runs the input; this holds the buttons and texts.
+struct TcpIpUI {
+    Button host{}, join{}, cancel{};      // records 0x106, 0x107, 0x10a
+    Button box_cancel{}, box_ok{};        // 0x110, 0x111: the join box's
+    std::string host_label, join_label, cancel_label, ok_label;
+    std::string heading, ip_label, ip, host_text, join_text, prompt;
+    bool has_ip = false;                  // not 127.0.0.1: HOST, JOIN and the label are live
+    bool box_open = false;                // the join box is up
+    std::string address;                  // typed into it
+};
+TcpIpUI tcpip_ui(const Scene& scene, const std::string& own_ip);
+void render_tcpip(std::vector<std::uint8_t>& framebuffer, const Scene& scene, const TcpIpUI& tcpip, std::uint32_t elapsed_ms);
+
+// How many entries are unlocked, from what has been seen: game.exe's
+// chain (FUN_00431600) over its registry bits — 0x01 LoD ending: 7,
+// 0x80 LoD intro: 6, 0x10 act 4 end: 5, 0x08 act 4: 4, 0x40 act 3: 3,
+// 0x04 act 2: 2, else 1. We keep the same facts in cinematics_seen.
+int cinematics_unlocked(const std::string& seen);
+
+CinematicsUI cinematics_ui(const Scene& scene, int unlocked);
+
+void render_cinematics(std::vector<std::uint8_t>& framebuffer, const Scene& scene, const CinematicsUI& cinematics);
+
+// `coop`: the "coop_lobby" toggle: SINGLE PLAYER reads "SINGLE PLAYER / COOP".
+TitleUI title_ui(const Scene& scene, bool coop = false);
+
+}  // namespace d2d::client

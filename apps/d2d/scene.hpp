@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Scene: GameData (gamedata.hpp) plus what the client draws and plays.
+#pragma once
+
+#include "common.hpp"
+
+#include <cof.hpp>
+#include <compcode.hpp>
+#include <d2s.hpp>
+#include <d2s_items.hpp>
+#include <dc6.hpp>
+#include <dcc.hpp>
+#include <font.hpp>
+#include <log.hpp>
+#include <palette.hpp>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <map>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+namespace d2d::client {
+
+// A DC6 as a DCC sprite, its frames anchored at their offsets: the few
+// composite parts and overlays game.exe loads as DC6 (FUN_005fe610).
+d2d::dcc::Sprite dc6_as_dcc(std::span<const std::byte> bytes);
+// All the client draws and plays: GameData, plus the pixels, fonts and
+// palettes. The frontend's come from FUN_0042e6d0 (main-menu loader) —
+// see docs/research/re/frontend-menu-table.md.
+struct Scene : GameData {
+    d2d::palette::Palette pal;                // Sky — title/credits palette
+    d2d::palette::Palette charselect_pal;     // fechar — char-select/create palette
+    d2d::palette::Pl2     sky_pl2;            // Sky PL2 (title logo additive)
+    d2d::palette::Pl2     fechar_pl2;         // fechar PL2 (campfire additive)
+    d2d::dc6::Sprite      background;                 // TitleScreen or gameselectscreenEXP
+    d2d::dc6::Sprite      logo_static;        // Diablo2.dc6 — 320×151, classic only
+    d2d::dc6::Sprite      logo_bl, logo_br;   // D2logoBlack{Left,Right} — silhouettes
+    d2d::dc6::Sprite      logo_fl, logo_fr;   // D2logoFire{Left,Right} — animated fire
+    d2d::dc6::Sprite      btn_wide;           // WideButtonBlank
+    d2d::dc6::Sprite      btn_wide2;          // WideButtonBlank02
+    d2d::dc6::Sprite      btn_narrow;         // NarrowButtonBlank
+    d2d::dc6::Sprite      btn_short;          // ShortButtonBlank
+    d2d::dc6::Sprite      credits_bg;         // creditsbckgexpand.dc6 (or classic fallback)
+    // Character-creation screen (loaded by FUN_004326f0). SP button hops here.
+    d2d::dc6::Sprite      charcreate_bg;      // charactercreationscreenEXP.dc6
+    d2d::dc6::Sprite      fire;               // fire.DC6 — campfire between the classes
+    d2d::dc6::Sprite      medium_button;      // MediumButtonBlank.dc6 — char-select OK/EXIT (handle 0x77973c, Sky palette)
+    d2d::dc6::Sprite      cinematics_panel;   // FrontEnd\CinematicsSelectionEXP.dc6 (2x2, 326x427)
+    d2d::dc6::Sprite      medium_sel_button;  // MediumSelButtonBlank.dc6 — char-create OK/EXIT chrome (per FUN_004326f0)
+    d2d::dc6::Sprite      textbox;            // textbox.dc6 — name-entry chrome (single 169×26 frame)
+    d2d::dc6::Sprite      clickbox;           // clickbox.dc6 — Hardcore checkbox chrome (2 frames × 15×16, unchecked/checked)
+    d2d::dc6::Sprite      clickbox_grey;      // joingameclickboxgrey.dc6 — the locked Expansion box (record 0xD5: Druid, Assassin)
+    // Character-select screen assets (RE FUN_004359d0, handle 0x00779734).
+    // Slot chrome is 2-frame 256+16 wide × 93 tall (matches WideButton
+    // composite pattern). BG is 12-frame 4×3 grid of ≤256×256 tiles.
+    d2d::dc6::Sprite      charselect_bg;      // characterselectscreenEXP.dc6
+    d2d::dc6::Sprite      charselect_box;     // charselectbox.dc6 (filled slot)
+    d2d::dc6::Sprite      charselect_scroll;  // FrontEnd\joingamescrollbars.dc6
+    d2d::dc6::Sprite      tall_button;        // TallButtonBlank.dc6 (168×60) — CREATE / DELETE
+    d2d::dc6::Sprite      tcpip_bg;           // FrontEnd\tcpipbckg (handle 0x7797d0), 800x600 in 4x3 tiles
+    d2d::dc6::Sprite      ip_box;             // FrontEnd\IPAddressBox (0x7797d4), 218x26
+    d2d::dc6::Sprite      popup_ok_cancel;    // FrontEnd\PopUpOKCancel2 (0x779784), 264x176 in 2 frames
+    d2d::dc6::Sprite      cancel_button;      // FrontEnd\CancelButtonBlank (0x7797b4), 96x32, 2 frames
+    d2d::dc6::Sprite      difficulty_levels;  // CharSelect\DifficultyLevels (0x77976c), 326x200 in 2 frames
+    d2d::dc6::Sprite      popup_ok;           // FrontEnd\PopUpOK (0x779798), 264x176 in 2 frames
+    d2d::font::Font       font24;             // Font24 (font id 7): popup messages
+    d2d::font::Font       font42;             // Font42 (font id 3): screen titles
+    d2d::font::Font       font_formal12;      // FontFormal12 (font id 5): edit boxes
+    d2d::dc6::Sprite      cursor;             // CURSOR\ohand.dc6 — D2's gauntlet, 8 frames
+    d2d::dc6::Sprite      cursor_buysell;     // CURSOR\buysell.dc6 — the item-use cursors (frame 0 identify)
+    // Character composites (in-game player, char-select portraits). The
+    // COF names the body-part layers and their per-frame draw order; each
+    // layer is its own DCC, indexed by COF composite type (0 HD, 1 TR,
+    // 2 LG, 3 RA, 4 LA, 5 RH, 6 LH, 7 SH, 8.. S1..S8). What each layer
+    // wears comes from 16 appearance bytes — a .d2s header's, or a new
+    // character's starting gear — through `comp` (components/compcode).
+    struct PlayerAnim : AnimTiming {
+        d2d::cof::Cof                     cof;
+        // Each layer's DCC file, decoded when it's first drawn: the World
+        // reads only the COF and timings (a mode's length, its hit frame).
+        mutable std::array<std::vector<std::byte>, 16> dcc;
+        mutable std::array<d2d::dcc::Sprite, 16>       decoded;
+        std::array<const std::uint8_t*, 16>            tint{};   // each layer's colormap (256), null: none
+        std::string                                    kind;     // D2D_ANIM_LOG's kind (chars, monsters, objects, ...)
+        mutable bool                                   noted = false;   // logged: a frame of it reached the screen
+        [[nodiscard]] const d2d::dcc::Sprite& layer(std::size_t layer_index) const {
+            if (!dcc[layer_index].empty()) {
+                try { decoded[layer_index] = d2d::dcc::Sprite(dcc[layer_index]); if (tint[layer_index]) decoded[layer_index].remap(tint[layer_index]); }
+                catch (const std::exception& error) { d2d::log::warn("{} layer {}: {}", name, layer_index, error.what()); }
+                dcc[layer_index] = {};
+            }
+            return decoded[layer_index];
+        }
+    };
+    // Loaded on first use and kept — decoding every composite up front
+    // doubled startup. `mutable` so the const Scene renderers can fill it.
+    mutable std::map<std::array<std::uint8_t, 34>, PlayerAnim> composites;
+    // Class animations — 7 classes × 5 states, per the RE'd class table at
+    // 0x00708a00. State order matches D2's suffix scheme: nu1, nu2, fw,
+    // nu3, bw. Class order (rows in the table): assassin, druid, amazon,
+    // necromancer, barbarian, sorceress, paladin — but we store them in
+    // our left-to-right visual order (barb/necro/pally/ama/sorc/druid/assn)
+    // to match Scene::class positions.
+    std::array<std::array<d2d::dc6::Sprite, 5>, 7> class_anims;
+    d2d::font::Font       font;
+    d2d::font::Font       font_small;         // font8 — long panel values
+    d2d::font::Font       font_tiny;          // font6 — panel labels
+    // Credits.txt / ExpansionCredits.txt parsed to plain Latin-1 lines.
+    // A '*' prefix on a line marks a section header in D2's format.
+    std::vector<std::string> credits;
+    // Character saves from <user dir>/save/*.d2s, most recently played first,
+    // with each save's items (empty if they couldn't be parsed).
+    std::vector<d2d::d2s::Header> saves;
+    std::vector<std::vector<d2d::d2s::Item>> save_items;
+    std::vector<d2d::d2s::Stats> save_stats;
+    std::vector<std::vector<d2d::d2s::Item>> save_corpses;   // each save's corpse list (its items), empty: none
+    std::vector<std::vector<d2d::d2s::Item>> save_mercs;     // each save's merc's gear (after "jf")
+    mutable std::unordered_map<std::string, std::optional<d2d::dc6::Sprite>> item_sprites;
+    mutable std::unordered_map<std::string, std::optional<d2d::dc6::Sprite>> flippy_sprites;
+    mutable std::unordered_map<std::string, std::optional<d2d::dc6::Sprite>> hireable_icons;
+    const d2d::dc6::Sprite* flippy(const std::string& code) const;   // an item code's ground animation
+    // An item's inventory graphic: the unique's/set item's own invfile,
+    // else the picture variant (ItemTypes InvGfx<n>), else the base's.
+    const d2d::dc6::Sprite* item_sprite(const d2d::d2s::Item& item) const;
+    const d2d::dc6::Sprite* hireable_icon(const std::string& name) const;   // ui\Hireables\<name>.dc6: a merc's / pet's portrait
+    // The item's colormap (256 entries), or null (FUN_0062c100): inv, the
+    // inventory's (InvTrans, invtransform); else the character's and the
+    // ground's (Transform, chrtransform).
+    [[nodiscard]] const std::uint8_t* item_map(const d2d::d2s::Item& item, bool inv) const {
+        const auto piece = item_pieces.find(item.code);
+        if (piece == item_pieces.end()) return nullptr;
+        const int transform = inv ? piece->second.inv_transform : piece->second.transform;
+        if (!d2d::compcode::tints_with(transform) || colormaps[std::size_t(transform)].size() < 21 * 256) return nullptr;
+        const int colour = item_colours.of(item.quality, item.unique_id, item.set_id, item.prefix, item.suffix, item.affixes, item.class_affix,
+                                      item.socketed && !item.socketed_items.empty() ? item.socketed_items[0].code : std::string{}, inv);
+        return colour < 0 || colour >= 21 ? nullptr : colormaps[std::size_t(transform)].data() + colour * 256;
+    }
+    // pal through a colormap (null: pal itself).
+    [[nodiscard]] static d2d::palette::Palette mapped(const d2d::palette::Palette& base, const std::uint8_t* map) {
+        if (!map) return base;
+        std::array<d2d::palette::Rgba, 256> entries;
+        for (std::size_t i = 0; i < 256; ++i) entries[i] = base[i == 0 ? 0 : map[i]];
+        return d2d::palette::Palette(entries);
+    }
+    [[nodiscard]] d2d::palette::Palette item_pal(const d2d::d2s::Item& item, const d2d::palette::Palette& base) const {
+        return mapped(base, item_map(item, true));
+    }
+    std::vector<std::string> unique_inv, set_inv;             // invfile, rows as item_names
+    d2d::dc6::Sprite popbelt;                          // PANEL\ctrlpnl_popbelt
+    std::unordered_map<std::string, std::array<std::string, 6>> type_invgfx;
+    std::array<d2d::dc6::Sprite, 2> stash_panel;
+    d2d::dc6::Sprite trade_panel, trade_button;   // PANEL\trade, PANEL\tradebtn
+    std::array<d2d::dc6::Sprite, 7> class_icons;  // Hireables\<class>Icon by d2s class: party portraits
+    d2d::dc6::Sprite cube_panel;
+    d2d::dc6::Sprite transmute_button;                 // PANEL\miniconvert.dc6: the Cube's Transmute, 0 up / 1 held
+    d2d::dc6::Sprite inv_panel;                       // PANEL\invchar6.dc6
+    d2d::dc6::Sprite inv_tab;                         // PANEL\invchar6Tab.dc6: weapon switch set II's tabs
+    d2d::dc6::Sprite border_frame;                    // PANEL\800BorderFrame.dc6: frames 0..4 round a left panel, 5..9 a right one
+    // A level's "entering" art (FUN_00455510): data\local\UI\ENG\ACT<n> (or EXPANSION past level 108)
+    // \<Levels.txt EntryFile>, by level Id; the Den's A1Q1 / the Tower's A1Q5 while that quest's open (0x70f860).
+    std::unordered_map<std::string, d2d::dc6::Sprite> entry_art;   // by path
+    std::unordered_map<int, std::string> level_entry, level_entry_quest;
+    // The rest of the empty body slots' outlines (FUN_004868b0; armour, helm / gloves, weapons with the Hireling's below).
+    d2d::dc6::Sprite inv_belt, inv_boots, inv_ring_amulet;
+    // Char panel stat buttons (docs/research/re/char-panel.md): PANEL\level
+    // (frame 1 pressed) on PANEL\levelsocket, the PANEL\skillpoints box.
+    d2d::dc6::Sprite level_button, level_socket, points_box;
+    // Skill tree (docs/research/re/skill-tree.md): SPELLS\skltree_<c>_back
+    // (frames 0..3 the panel, 4t..4t+3 tab t on top) and <Cl>Skillicon.
+    std::array<d2d::dc6::Sprite, 7> skill_tree_bg, skill_icons;   // by d2s class
+    d2d::dc6::Sprite generic_skill_icons;              // SPELLS\Skillicon: Attack and the other non-class skills
+    // The quest log's art (FUN_004a23d0 / FUN_004a3220): questbackground,
+    // expquesttabs, questsockets, and each quest's icon (a1q1 .. a5q6).
+    d2d::dc6::Sprite quest_last;                        // ui\menu\questlast: replay the quest's message
+    d2d::dc6::Sprite quest_bg, quest_tabs, quest_sockets;
+    d2d::dc6::Sprite quest_tabs_classic;                // ui\menu\questtabs: the classic game's four tabs
+    d2d::dc6::Sprite quest_done;                        // ui\menu\questdone: a finished quest's plate while held, by its icon
+    std::array<d2d::dc6::Sprite, 27> quest_icons;
+    d2d::dc6::Sprite ctrl_panel, globes, globe_glass; // 800ctrlpnl7 / hlthmana / overlap
+    d2d::dc6::Sprite run_button;                        // PANEL\runbutton (DAT_007bef0c)
+    int                   bg_tiles_across{4};
+
+    // The act's palette (palette\ACTn), the in-game one for the world and
+    // the UI alike (fechar/sky are frontend-only); load_act_palettes swaps
+    // it as the player changes act.
+    d2d::palette::Palette                    act_pal;
+    std::array<d2d::palette::Palette, 32>    act_lit;   // act_pal at each light level (PL2 +0x400)
+    d2d::palette::Palette act_text_red;              // act_pal through PL2's text colour 1 shift (the last 13 x 256: FUN_004f64b0's colour)
+    int                                      palette_act = -1;   // the act act_pal is (0-based)
+    d2d::dc6::Sprite focus16;                          // UI\CURSOR\focus16: menu hover marks
+    d2d::font::Font  font_formal11;                    // FontFormal11: NPC speech (font id 8)
+    d2d::font::Font  font_chat;                        // FontInGameChat (font id 0xd): chat lines
+    d2d::font::Font  font30;                           // Font30 (font id 2): the death screen's lines
+    d2d::dc6::Sprite you_died, you_died_inst;          // UI\ENG\youdiedhardcore, youdiedinst (FUN_00453100)
+    // The game menu and the mini-panel (docs/research/re/menu.md): the menus'
+    // text images by name (UI\ENG\<name>), the slider (Widgets\OptBar,
+    // OptBarC, OptSkull), CURSOR\pentspin, PANEL\menubutton, minipanel_s
+    // and minipanelbtn.
+    std::unordered_map<std::string, d2d::dc6::Sprite> menu_text;
+    d2d::dc6::Sprite pentspin, opt_bar, opt_bar_c, opt_skull, menu_button, minipanel, minipanel_btn;
+    d2d::dc6::Sprite boxpieces, textslid;   // Configure Controls: UI\menu\boxpieces (its frame), textslid (its scroll bar)
+    d2d::dc6::Sprite help_border, help_white_bullet, help_yellow_bullet;   // the Help screen: UI\Menu\800helpborder, helpwhitebullet, helpyellowbullet
+    // The Hireling screen (FUN_004868b0): PANEL\NPCInv, the empty slots' inv_armor, inv_helm_glove, inv_weapons.
+    d2d::dc6::Sprite npc_inv, inv_armor, inv_helm_glove, inv_weapons;
+    d2d::dc6::Sprite party_panel, party_buttons, party_boxes, party_bar;   // the Party screen: UI\Menu\party, partybuttons, partyboxes, partybar
+    // Automap: AutoMap.txt resolved like FUN_0061fcf0 — LevelName through
+    // game.exe's level-type names (0x6e7d50: "None", "1 Town", ...),
+    // TileName through its orientation names (0x6e7f90: fl wl wr wtlr
+    // wtll wtr wbl wbr wld wrd wle wre co sh tr rf ld rd fd fi), Style =
+    // main index, Start/EndSequence = sub-index range, the valid Cel1..4
+    // (FUN_0061fff0 picks one at random). Act 1 draws MaxiMap.dc6.
+    struct AutomapRule { int level_type = 0, orientation = 0, main = -1, sub0 = -1, sub1 = -1; std::vector<int> cels; };
+    d2d::dc6::Sprite store_panel, store_tabs, store_buttons;   // PANEL\buysell, buyselltabs, buysellbtn
+    d2d::dc6::Sprite gold_coin;                                   // PANEL\goldcoinbtn
+    d2d::dc6::Sprite gold_dialog, spinner;                       // MENU\dialogbackground, MENU\spinner (the gold box)
+    d2d::dc6::Sprite gem_socket;                                  // PANEL\GemSocket (0x7bef14)
+    d2d::dc6::Sprite wp_bg, wp_icons;
+    std::array<d2d::dc6::Sprite, 2> wp_tabs;                      // [expansion]: waygatetabs / expwaygatetabs
+    d2d::dc6::Sprite automap_cels;                     // UI\AutoMap\MaxiMap.dc6
+    d2d::dc6::Sprite automap_cels_small;               // UI\AutoMap\MaxiMapS.dc6: the mini map's
+    std::unordered_map<std::string, d2d::dcc::Sprite> missile_cels;   // a missile's CelFile DCC, by Missiles.txt row name
+    std::array<d2d::dc6::Sprite, 4> rain_splash;       // UncompOverlays\Rain1..4 (Rain3 / 4 splash where drops fall)
+    d2d::dcc::Sprite npc_alert;                        // Overlay.txt npcalert: NPCSpeechBalloon.dcc
+    mutable std::unordered_map<const OverlayInfo*, d2d::dcc::Sprite> overlay_sprites;   // loaded when first drawn
+    // A monster's colour (FUN_00477530): 2..7 its graphic's
+    // COF\palshift.dat table, 8..29 RandTransforms.dat's table - 8; else none.
+    mutable std::unordered_map<std::string, std::vector<std::uint8_t>> palshifts;   // by monster code, loaded when first drawn
+    std::vector<std::uint8_t> rand_transforms;         // Monsters\RandTransforms.dat: 30 x 256
+    const std::uint8_t* monster_map(const Npc& npc) const;
+    const d2d::dcc::Sprite* overlay_sprite(const OverlayInfo& overlay) const;
+    mutable std::map<std::string, PlayerAnim> npc_anims;   // by root/code/mode/components
+    const PlayerAnim& npc_anim(const Npc& npc, std::string_view mode) const;
+    const PlayerAnim& composite(int d2s_class, int mode, const Appearance& gfx) const;
+    // D2D_ANIM_LOG=<file>: each animation's first draw ("chars AMA1HTH",
+    // "monsters FANUHTH", "missiles firebolt", ...) is appended to it, for
+    // tools/anim_coverage.py. Nothing is written when it isn't set.
+    static void note_drawn(std::string_view kind, std::string_view name);
+    std::vector<AutomapRule> automap_rules;
+
+};
+
+}  // namespace d2d::client

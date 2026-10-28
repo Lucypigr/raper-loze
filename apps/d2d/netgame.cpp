@@ -1,0 +1,730 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "netgame.hpp"
+
+#include "game_api.hpp"
+
+#include <d2gs/c2s.hpp>
+#include <d2gs/c2s_names.hpp>
+#include <d2gs/exe_tables.hpp>
+#include <d2gs/s2c.hpp>
+#include <d2gs/s2c_names.hpp>
+#include <d2gs/wire.hpp>
+#include <log.hpp>
+#include <d2s_items.hpp>
+#include <join.hpp>
+#include <tcp.hpp>
+
+#include <algorithm>
+#include <array>
+#include <bitset>
+#include <chrono>
+#include <cmath>
+#include <format>
+#include <string_view>
+#include <utility>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <expected>
+#include <filesystem>
+#include <memory>
+#include <span>
+#include <string>
+#include <vector>
+
+namespace {
+
+using d2d::net::d2gs::read_name;
+using d2d::net::d2gs::read_u16;
+using d2d::net::d2gs::read_u32;
+
+auto key(int type, std::uint32_t id) -> std::uint64_t { return std::uint64_t(type) << 32 | id; }
+
+// The S->C ids NetGame acts on (the net log's "used").
+auto used_ids() -> std::bitset<256> {
+    std::bitset<256> used;
+    for (const int id : { 0x75, 0x7f, 0x8d, 0x10, 0x26, 0x5a, 0x01, 0x02, 0x03, 0x04, 0x06, 0x09, 0x27, 0x5d, 0x81, 0x9c, 0x9d, 0x42, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x0a, 0x0c, 0x0d, 0x0f, 0x15, 0x18, 0x0e, 0x28, 0x77, 0x78, 0x79, 0x82, 0x8b, 0x8c, 0x8e, 0x2c, 0x51, 0x59, 0x5c, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x95, 0x96, 0xac, 0xab, 0xaf, 0xb3, 0xb4 })
+        used.set(std::size_t(id));
+    return used;
+}
+
+// d2d.log's view of the stream (the net log file has all of it):
+// warning for an id nobody has looked at, debug every packet, trace bytes.
+auto log_packet(std::string_view arrow, std::string_view name, const d2d::net::Bytes& packet) -> void {
+    if (packet.empty()) return;
+    auto bytes = [&] { std::string out; for (const auto byte : packet) out += std::format(" {:02x}", byte); return out; };
+    if (name.empty()) d2d::log::warn("net: {} {:02x} unknown ({} bytes):{}", arrow, packet[0], packet.size(), bytes());
+    else d2d::log::debug("net: {} {:02x} {} ({} bytes)", arrow, packet[0], name, packet.size());
+    if (d2d::log::enabled(d2d::log::Level::trace)) d2d::log::trace("net: {} {:02x}{}", arrow, packet[0], bytes());
+}
+
+auto steady_ms() -> std::uint32_t {
+    static const auto start = std::chrono::steady_clock::now();
+    return std::uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+constexpr float kWalkSubtilesPerSec = d2d::game::cells_per_sec(6) * 5;   // a player's walk (6)
+// The host walks us at most about 0x32 subtiles in one go; a target further
+// off gets a 0x15 snap back (live 2026-10-18: none under 45 out, most past
+// 50). A longer walk goes in legs this long.
+constexpr float kWalkReach = 40;
+// A run: velocitypercent + run * 100 / walk - 100 (FUN_00620e80), every class's 9 / 6.
+constexpr float kRunSubtilesPerSec = d2d::game::cells_per_sec(9) * 5;
+
+} // namespace
+
+NetGame::NetGame(d2d::net::JoinSession joined, d2d::net::TcpConnection socket, const std::filesystem::path& log_path)
+    : session(std::move(joined)), connection(std::move(socket)), log(log_path, used_ids()) {}
+
+auto NetGame::join(const std::string& host, const std::filesystem::path& game_exe, std::vector<std::uint8_t> save,
+                   const std::filesystem::path& log_path, int timeout_ms, const d2d::d2s::ItemTables* item_tables, bool auto_party,
+                   std::vector<std::pair<int, int>> send_bits, std::vector<std::array<std::uint8_t, 16>> monster_parts)
+    -> std::expected<std::unique_ptr<NetGame>, JoinError> {
+    const auto tables = d2d::net::d2gs::load_exe_tables(game_exe);
+    if (!tables) return std::unexpected(JoinError{ tables.error() });
+    auto session = d2d::net::JoinSession::create(*tables, std::move(save));
+    if (!session) return std::unexpected(JoinError{ session.error() });
+    auto connection = d2d::net::TcpConnection::connect(host, 4000, 5000);
+    if (!connection) return std::unexpected(JoinError{ connection.error(), true });
+    std::unique_ptr<NetGame> game(new NetGame(std::move(*session), std::move(*connection), log_path));
+    game->item_tables = item_tables;
+    game->auto_party = auto_party;
+    game->stat_send_bits = std::move(send_bits);   // before the first 0xaa: join pumps the world in
+    game->monster_parts = std::move(monster_parts);   // and the first 0xac (the bosses near where we land)
+    game->log.note("joining " + host + " as " + game->session.name());
+    const auto deadline = steady_ms() + std::uint32_t(timeout_ms);
+    while (game->session.state() != d2d::net::JoinState::InGame) {
+        if (steady_ms() > deadline) return std::unexpected(JoinError{ "the host didn't put us in the game within " + std::to_string(timeout_ms / 1000) + " s" });
+        game->pump(steady_ms(), 0);
+        if (game->closed()) {
+            if (game->session.state() == d2d::net::JoinState::Refused)
+                return std::unexpected(JoinError{ "the host refused the join (reason " + std::to_string(game->session.refused_reason()) + ")",
+                                                  false, game->session.refused_reason() });
+            return std::unexpected(JoinError{ std::string("the join ended: ") + d2d::net::join_state_name(game->session.state()) + " " + game->session.desync_reason() });
+        }
+    }
+    game->log.note("in the game: map seed " + std::to_string(game->map_seed) + ", difficulty " + std::to_string(game->difficulty));
+    return game;
+}
+
+auto NetGame::send(const std::vector<d2d::net::Bytes>& packets) -> void {
+    for (const auto& packet : packets) {
+        // FUN_00478350: a packet the same as the last one sent within 200 ms
+        // is dropped (a held button doesn't flood).
+        const auto now = steady_ms();
+        if (packet == last_sent && now - last_sent_ms < 200) continue;
+        last_sent = packet;
+        last_sent_ms = now;
+        log_packet("C>S", d2d::net::d2gs::c2s_name(packet[0]), packet);
+        log.to_host(packet);
+        if (auto sent = connection.send(packet); !sent) log.note("send failed: " + sent.error());
+    }
+}
+
+auto NetGame::steady_now() -> std::uint32_t { return steady_ms(); }
+
+auto NetGame::trade_answer(bool accept) -> void {
+    send({ d2d::net::d2gs::c2s::click_button(accept ? 3 : 2) });
+    trade.state = accept ? 3 : 0;
+}
+
+auto NetGame::trade_accept() -> void {
+    send({ d2d::net::d2gs::c2s::click_button(4, std::uint16_t(trade.our_gold >> 16), std::uint16_t(trade.our_gold)) });
+    trade.state = 7;
+}
+
+auto NetGame::say(std::string_view message) -> void { send({ d2d::net::d2gs::c2s::chat(message) }); }
+auto NetGame::phrase(std::uint16_t which) -> void { send({ d2d::net::d2gs::c2s::phrase(which) }); }
+auto NetGame::merc_item(std::uint16_t slot) -> void { send({ d2d::net::d2gs::c2s::merc_item(slot) }); }
+
+auto NetGame::party_button(std::uint32_t player) -> void {
+    auto& other = units[key(0, player)];
+    const int action = other.relation == 0 ? 6 : other.relation == 4 ? 7 : other.relation == 2 ? 8 : 9;
+    other.relation = other.relation == 0 ? 4 : other.relation == 4 ? 0 : 1;      // FUN_00479eb0's own guess, until 0x8b
+    if (action == 7 || action == 9) { if (!std::ranges::contains(no_auto_invite, player)) no_auto_invite.push_back(player); }
+    else std::erase(no_auto_invite, player);
+    send({ d2d::net::d2gs::c2s::party(std::uint8_t(action), player) });
+}
+
+auto NetGame::leave_party() -> void {
+    for (const auto& [unit_key, unit] : units)                                    // the party left: autoparty doesn't ask them back
+        if (unit.type == 0 && unit.id != self_id && unit.relation == 3 && !std::ranges::contains(no_auto_invite, unit.id)) no_auto_invite.push_back(unit.id);
+    send({ d2d::net::d2gs::c2s::party(9, self_id) });
+}
+
+auto NetGame::relation(std::uint32_t player, int flag) -> void {
+    auto& other = units[key(0, player)];
+    other.flags ^= flag;                                                          // FUN_00479d30
+    send({ d2d::net::d2gs::c2s::relation(std::uint8_t(flag), (other.flags & flag) != 0, player) });
+}
+
+auto NetGame::trade_cancel() -> void {
+    send({ d2d::net::d2gs::c2s::click_button(2) });
+    auto offered = std::move(trade.ours);
+    trade = {};
+    trade.ours = std::move(offered);                      // they come back to our bags
+    trade.settle_until = steady_ms() + 5000;
+    store_items.clear();
+}
+
+auto NetGame::trade_gold(std::uint32_t gold) -> void {
+    namespace c2s = d2d::net::d2gs::c2s;
+    if (trade.state == 5 || trade.state == 7) { send({ c2s::click_button(7) }); trade.state = 3; }
+    trade.our_gold = gold;
+    send({ c2s::click_button(8, std::uint16_t(gold >> 16), std::uint16_t(gold)) });
+}
+
+auto NetGame::trade_settling() const -> bool { return steady_ms() < trade.settle_until; }
+
+auto NetGame::send_items(const std::vector<d2d::net::Bytes>& packets) -> void {
+    if (session.state() != d2d::net::JoinState::InGame) return;
+    for (const auto& packet : packets) {
+        if (packet.empty() || packet[0] != 0x20) { send({ packet }); continue; }
+        if (when_still.empty()) still_since_ms = steady_ms();
+        when_still.push_back(packet);
+    }
+}
+
+auto NetGame::closed() const -> bool {
+    const auto state = session.state();
+    return socket_gone || state == d2d::net::JoinState::Closed || state == d2d::net::JoinState::Refused || state == d2d::net::JoinState::Desync;
+}
+
+auto NetGame::pump(std::uint32_t now_ms, std::uint32_t elapsed_ms) -> void {
+    if (!closed()) {
+        if (auto received = connection.receive(0); !received) {
+            log.note(received.error());
+            d2d::log::warn("net: {}", received.error());
+            socket_gone = true;
+        } else if (!received->empty()) {
+            heard_ms = now_ms;
+            auto step = session.receive(*received, now_ms);
+            for (const auto& packet : step.packets) {
+                log.from_host(packet);
+                log_packet("S>C", d2d::net::d2gs::s2c_name(packet[0]), packet);
+                handle(packet);
+            }
+            send(step.to_send);
+            if (session.state() == d2d::net::JoinState::Desync) d2d::log::warn("net: the stream broke: {}", session.desync_reason());
+        }
+        // The host answers our 0x6d every 5 s: silence that long means it's
+        // gone without a word (live 2026-10-18: TCP took 18 min to say so).
+        if (session.state() == d2d::net::JoinState::InGame && heard_ms != 0 && now_ms - heard_ms > kSilentMs) {
+            log.note("the host's said nothing for " + std::to_string(kSilentMs / 1000) + " s");
+            d2d::log::warn("net: the host's said nothing for {} s; gone", kSilentMs / 1000);
+            socket_gone = true;
+        }
+        send(session.tick(now_ms));
+        // A long walk's next leg, once the host has us near this one's end.
+        if (walk_goal_x >= 0 && std::hypot(walk_to_x - host_x, walk_to_y - host_y) < 5)
+            move_to(walk_goal_x, walk_goal_y, walk_goal_run);
+        // Stopped: no walk sent for as long as the host's player needs to
+        // reach the last one from where it last said it was (at a walk's
+        // speed, the slower), and no word of walking lately; or 5 s.
+        if (!when_still.empty()) {
+            const float left = std::hypot(walk_to_x - host_x, walk_to_y - host_y);
+            const auto needs = std::uint32_t(std::min(left / kWalkSubtilesPerSec * 1000.f, 4000.f)) + 500;
+            if ((steady_ms() - walk_sent_ms >= needs && steady_ms() - walked_ms >= 300) || steady_ms() - still_since_ms >= 5000)
+                send(std::exchange(when_still, {}));
+        }
+    }
+    // A monster walks its path at MonStats Velocity x stat 0x43 / 100 in any
+    // mode (FUN_00462a20, FUN_00620e40's walk); the host's moves set 0x43
+    // (FUN_004aff60). Players at a walk.
+    for (auto& [unit_key, unit] : units) {
+        if (!unit.moving) continue;
+        const bool known = unit.type == 1 && unit.cls >= 0 && std::size_t(unit.cls) < monster_velocity.size();
+        const float per_sec = known ? d2d::game::cells_per_sec(float(monster_velocity[std::size_t(unit.cls)])) * 5 * float(unit.velocity_pct) / 100.f
+                              : unit.running ? kRunSubtilesPerSec : kWalkSubtilesPerSec;
+        const float step = per_sec * float(elapsed_ms) / 1000.f;
+        const float dx = unit.goal_x - unit.x, dy = unit.goal_y - unit.y, distance = std::hypot(dx, dy);
+        if (distance <= step) { unit.x = unit.goal_x; unit.y = unit.goal_y; unit.moving = false; continue; }
+        unit.x += dx / distance * step;
+        unit.y += dy / distance * step;
+    }
+}
+
+auto NetGame::handle(const d2d::net::Bytes& packet) -> void {
+    auto unit_at = [&](int type, std::uint32_t id) -> Unit& {
+        auto& unit = units[key(type, id)];
+        unit.type = type;
+        unit.id = id;
+        return unit;
+    };
+    auto place = [](Unit& unit, float x, float y) { unit.x = unit.goal_x = x; unit.y = unit.goal_y = y; unit.moving = false; };
+    auto walk = [](Unit& unit, float x, float y) { unit.goal_x = x; unit.goal_y = y; unit.moving = true; };
+    const std::size_t size = packet.size();
+    switch (packet[0]) {
+    case 0x01: if (size >= 2) difficulty = packet[1]; break;
+    case 0x03:
+        if (size >= 8) { act = packet[1]; map_seed = read_u32(packet, 2); area = read_u16(packet, 6); }
+        break;
+    case 0x59:   // assign player: id, class, name, x, y (ours comes at 0, 0: its place is the 0x15)
+        if (size >= 26) {
+            auto& unit = unit_at(0, read_u32(packet, 1));
+            unit.cls = packet[5];
+            unit.name = std::string(read_name(packet, 6, 16));
+            // Ours comes at 0, 0; our corpse from an earlier game comes as a
+            // player of our name too, at its spot (live 2026-10-17, then 0x74).
+            if (unit.name == session.name() && read_u16(packet, 0x16) == 0 && read_u16(packet, 0x18) == 0) self_id = unit.id;
+            place(unit, read_u16(packet, 0x16), read_u16(packet, 0x18));
+        }
+        break;
+    case 0x15:   // reassign: type, id, x, y
+        if (size >= 10) {
+            auto& unit = unit_at(packet[1], read_u32(packet, 2));
+            place(unit, read_u16(packet, 6), read_u16(packet, 8));
+            if (unit.type == 0 && unit.id == self_id) { self_x = host_x = unit.x; self_y = host_y = unit.y; reassigned = true; }
+        }
+        break;
+    case 0x0f:   // a unit to x, y: +1 type, +2 id, +6 the command (1 walk, 0x17 run), +7 target, +0xc where it is
+        if (size >= 16) {
+            auto& unit = unit_at(packet[1], read_u32(packet, 2));
+            unit.x = read_u16(packet, 0xc); unit.y = read_u16(packet, 0xe);
+            walk(unit, read_u16(packet, 7), read_u16(packet, 9));
+            unit.running = packet[6] == 0x17;
+        }
+        break;
+    case 0x10:   // a unit to a unit: +6 the command (0 walk, 0x18 run), +7 target type, +8 id, +0xc where it is
+        if (size >= 16) {
+            auto& unit = unit_at(packet[1], read_u32(packet, 2));
+            place(unit, read_u16(packet, 0xc), read_u16(packet, 0xe));
+            if (const auto target = units.find(key(packet[7], read_u32(packet, 8))); target != units.end() && &target->second != &unit)
+                walk(unit, target->second.x, target->second.y);   // ponytail: to where the target was, not following it
+            unit.running = packet[6] == 0x18;
+        }
+        break;
+    case 0x95:   // our life, mana, stamina and place: bits 8 id, 15, 15, 15, 16 x, 16 y
+    case 0x96:   // ... walk verify: 8 id, 15 stamina, 16 x, 16 y
+    case 0x18: { // ... 8 id, 15, 15, 15, 7, 7, 16 x, 16 y
+        const std::size_t skip = packet[0] == 0x96 ? 23 : packet[0] == 0x95 ? 53 : 67;
+        if (size * 8 < skip + 32) break;
+        auto bits_at = [&](std::size_t first, int count) {
+            std::uint32_t value = 0;
+            for (int bit = 0; bit < count; ++bit) value |= std::uint32_t(packet[(first + std::size_t(bit)) / 8] >> ((first + std::size_t(bit)) % 8) & 1) << bit;
+            return value;
+        };
+        host_x = float(bits_at(skip, 16));
+        host_y = float(bits_at(skip + 16, 16));
+        if (packet[0] == 0x96) walked_ms = steady_ms();
+        // Life, mana, stamina: whole points, stats 6 / 8 / 10 take them << 8
+        // (FUN_0045d4b0); 0x96 has stamina alone.
+        if (packet[0] == 0x96) {
+            stat_changes.push_back({ 10, std::int64_t(bits_at(8, 15)) << 8, false });
+        } else {
+            stat_changes.push_back({ 6, std::int64_t(bits_at(8, 15)) << 8, false });
+            stat_changes.push_back({ 8, std::int64_t(bits_at(23, 15)) << 8, false });
+            stat_changes.push_back({ 10, std::int64_t(bits_at(38, 15)) << 8, false });
+        }
+        break;
+    }
+    case 0x51:   // assign object: +1 type (2), +2 id, +6 Objects.txt row, +8 x, +0xa y
+        if (size >= 12) {
+            auto& unit = unit_at(packet[1], read_u32(packet, 2));
+            unit.cls = read_u16(packet, 6);
+            place(unit, read_u16(packet, 8), read_u16(packet, 0xa));
+        }
+        break;
+    case 0x09:   // assign warp: +1 type (5), +2 id, +6 LvlWarp row, +7 x, +9 y
+        if (size >= 11) {
+            auto& unit = unit_at(packet[1], read_u32(packet, 2));
+            unit.cls = packet[6];
+            place(unit, read_u16(packet, 7), read_u16(packet, 9));
+        }
+        break;
+    case 0x9c: {  // an item in the world: +1 action, +4 id, the item from +8
+        if (size < 9 || !item_tables) break;
+        const int action = packet[1];
+        const std::uint32_t id = read_u32(packet, 4);
+        auto parsed = d2d::d2s::parse_net_item(std::as_bytes(std::span(packet)).subspan(8), *item_tables);
+        if (!parsed) { log.note("item " + std::to_string(id) + " (0x9c action " + std::to_string(action) + ") didn't parse"); break; }
+        if (action == 0 || action == 2 || action == 3) {
+            own_items.erase(id);
+            ground[id] = GroundItem{ id, std::move(parsed->item), parsed->x, parsed->y, parsed->gold };
+        } else if (action == 0xb) {
+            store_items[id] = std::move(parsed->item);                 // into the open store's stock
+        } else if (action == 0xc) {
+            store_items.erase(id);
+        } else if (trade.state >= 3 && action == 4 && parsed->item.panel == 2
+                   && std::ranges::none_of(trade.ours, [&](const auto& offered) { return std::uint32_t(offered.id) == id; })) {
+            store_items[id] = std::move(parsed->item);                 // their offer: into page 2 (live, 2026-10-05)
+        } else {                                                       // ours, somewhere
+            ground.erase(id);
+            if (trade.state != 0 || steady_ms() < trade.settle_until)   // ponytail: a trade's item packets aren't pinned down yet
+                log.note("trade: item " + std::to_string(id) + " " + parsed->item.code + " action " + std::to_string(action) + " panel " + std::to_string(parsed->item.panel));
+            const bool traded = (action == 4 || action == 0xe) && steady_ms() < trade.settle_until
+                                && (!own_items.contains(id) || std::ranges::any_of(trade.ours, [&](const auto& offered) { return std::uint32_t(offered.id) == id; }));
+            if (traded) std::erase_if(trade.ours, [&](const auto& offered) { return std::uint32_t(offered.id) == id; });
+            if ((action == 4 || action == 0xe) && (traded || id == picking || (buying && !own_items.contains(id)))) {
+                picked.push_back(parsed->item);
+                picking = 0;
+                buying = false;
+            }
+            if (steady_ms() < trade.settle_until) {                   // a trade's resend: the old id at that spot is gone
+                const auto& fresh = parsed->item;
+                std::erase_if(own_items, [&](const auto& entry) {
+                    const auto& held = entry.second;
+                    return held.location == fresh.location && held.panel == fresh.panel && held.column == fresh.column && held.row == fresh.row && held.slot == fresh.slot;
+                });
+            }
+            own_items[id] = std::move(parsed->item);
+        }
+        break;
+    }
+    case 0x9d: {  // an item owned by a unit: +8 owner type, +9 owner id, the item from +13
+        if (size < 14 || !item_tables || packet[8] != 0) break;
+        const std::uint32_t id = read_u32(packet, 4), owner = read_u32(packet, 9);
+        auto parsed = d2d::d2s::parse_net_item(std::as_bytes(std::span(packet)).subspan(13), *item_tables);
+        if (!parsed) { log.note("item " + std::to_string(id) + " (0x9d action " + std::to_string(packet[1]) + ") didn't parse"); break; }
+        if (owner == self_id) { own_items[id] = std::move(parsed->item); break; }
+        // Another player's: what they wear is their look. A swap (7, 9)
+        // sends only the incoming item, so it pushes out that slot's old one.
+        // ponytail: the weapon switch (0x17) isn't followed; slots 0xb / 0xc aren't drawn.
+        auto& worn = unit_at(0, owner).worn;
+        std::erase_if(worn, [&](const auto& entry) { return entry.first == id || entry.second.slot == parsed->item.slot; });
+        if (parsed->item.location == d2d::d2s::item_location::kEquipped) worn[id] = std::move(parsed->item);
+        break;
+    }
+    case 0x42:   // our cursor's item is gone
+        std::erase_if(own_items, [](const auto& entry) { return entry.second.location == d2d::d2s::item_location::kCursor; });
+        break;
+    case 0x19: if (size >= 2) stat_changes.push_back({ 14, packet[1], true }); break;   // gold +=
+    case 0x1a: if (size >= 2) stat_changes.push_back({ 13, packet[1], true }); break;   // experience +=
+    case 0x1b: if (size >= 3) stat_changes.push_back({ 13, read_u16(packet, 1), true }); break;
+    case 0x1c: if (size >= 5) stat_changes.push_back({ 13, read_u32(packet, 1), false }); break;
+    case 0x1d: if (size >= 3) stat_changes.push_back({ packet[1], packet[2], false }); break;   // stat =
+    case 0x1e: if (size >= 4) stat_changes.push_back({ packet[1], read_u16(packet, 2), false }); break;
+    case 0x1f: if (size >= 6) stat_changes.push_back({ packet[1], read_u32(packet, 2), false }); break;
+    case 0x0e:   // object state: +1 type (2), +2 id, +8 u32 the new mode
+        if (size >= 12 && packet[1] == 2) object_modes.push_back({ read_u32(packet, 2), int(read_u32(packet, 8)) });
+        break;
+    case 0x5d: {   // quest log news: +1 quest record, +2 flags (2: a sound), +3 log state, +4 s16 (quests.md)
+        // No flags: the record's log state (its row is its word) and the Quest
+        // Log button; flags 0x20 (the Den's): the state and the count.
+        const int row = size >= 4 ? d2d::net::d2gs::s2c::quest_word_of_record(packet[1]) : -1;
+        if (row >= 0 && (packet[2] == 0 || (packet[2] & 0x20) != 0)) quest_log[std::size_t(row)] = packet[3];
+        if (row >= 0 && packet[2] == 0) quest_news.push_back(row);
+        if (size >= 6 && (packet[2] & 0x20) != 0) den_left = std::int16_t(read_u16(packet, 4));
+        send({ d2d::net::d2gs::c2s::update_quests() });   // the words behind it (0x28)
+        break;
+    }
+    case 0x61:   // a cinematic (FUN_0053d940 -> the client's FUN_00482ef0): +1 its index
+        if (size >= 2) movie = packet[1];
+        break;
+    case 0x53:   // the act's day (FUN_0061c240): +1 u32 phase, +5 u32 time, +9 u8 eclipse
+        if (size >= 10) sky = Sky{ int(read_u32(packet, 1)), int(read_u32(packet, 5)), packet[9] != 0 };
+        break;
+    case 0x52:   // player quest info: 41 log states by quest word (FUN_004a40d0 -> 0x7bf355)
+        if (size >= 42) { std::copy_n(packet.begin() + 1, 41, quest_log.begin()); quest_log_known = true; }
+        break;
+    case 0x29:   // game quest info: the game's 48 quest words (FUN_0065c4d0 -> 0x7c0d47)
+        if (size >= 97) for (std::size_t word = 0; word < 48; ++word) game_quests[word] = read_u16(packet, 1 + 2 * word);
+        break;
+    case 0x28:   // quest info: +1 6 (the player's own), +7 its 96 quest words (FUN_004b6dd0 -> FUN_0065c4d0)
+        if (size >= 103 && packet[1] == 6) {
+            quest_words.emplace();
+            std::copy_n(packet.begin() + 7, 96, quest_words->begin());
+        }
+        break;
+    case 0x27:   // NPC info: +1 mode, +2 unit id (the answer to an 0x13 on an NPC)
+        if (size >= 6) npc_info = read_u32(packet, 2);
+        if (const auto lines = d2d::net::d2gs::s2c::npc_lines(packet)) {   // mode 1: its quest lines (built by the host's records, FUN_00543790)
+            NpcQuest npc_quest{ .id = lines->id };
+            for (const auto& line : lines->lines) npc_quest.lines.push_back({ int(line.message), line.greet });
+            npc_quests.push_back(std::move(npc_quest));
+        }
+        break;
+    case 0x8a:   // NPC interaction: +1 type, +2 id (the host's NPC think, FUN_00544660: one of its quests has something for us)
+        if (size >= 6 && packet[1] == 1) npc_alerts.push_back(read_u32(packet, 2));
+        break;
+    case 0x81:   // assign merc: +2 u16 class, +4 u32 owner, +8 u32 merc id
+        if (size >= 12 && read_u32(packet, 4) == self_id) merc_id = read_u32(packet, 8);
+        break;
+    case 0x0c:   // hit: +1 type, +2 id, +7 hit class, +8 life / 128
+        if (size >= 9) {
+            const int life = packet[8];
+            unit_at(packet[1], read_u32(packet, 2)).life = life > 128 ? life & 0x7f : life;
+        }
+        break;
+    case 0x69: case 0x6b:   // a monster's unit command at x, y (+5; net-packets.md "The unit command")
+    case 0x6a: case 0x6c:   // ... on a unit
+        if (size >= 6) {
+            auto& unit = unit_at(1, read_u32(packet, 1));
+            unit.mode = packet[5];
+            unit.mode_ms = steady_ms();
+            if (unit.mode == 8 || unit.mode == 9) { unit.life = 0; unit.moving = false; }   // dying / dead: no hit says so
+        }
+        break;
+    case 0xa8:   // set state: +1 type, +2 id, +6 length, +7 the state (its stat list after, unread)
+        if (size >= 8) {
+            if (packet[1] == 0 && read_u32(packet, 2) == self_id && !std::ranges::contains(self_states, int(packet[7]))) self_states.push_back(packet[7]);
+            if (auto& states = unit_at(packet[1], read_u32(packet, 2)).states; !std::ranges::contains(states, int(packet[7]))) states.push_back(packet[7]);
+        }
+        break;
+    case 0xa9:   // end state: +1 type, +2 id, +6 the state
+        if (size >= 7) {
+            if (packet[1] == 0 && read_u32(packet, 2) == self_id) std::erase(self_states, int(packet[6]));
+            std::erase(unit_at(packet[1], read_u32(packet, 2)).states, int(packet[6]));
+        }
+        break;
+    case 0xaa:   // a unit's states as it comes into view: +1 type, +2 id, +6 length; bits from +7 (FUN_0045efa0)
+        if (size >= 8) {
+            auto& states = unit_at(packet[1], read_u32(packet, 2)).states;
+            states.clear();
+            std::size_t bit_at = 7 * 8;
+            const std::size_t end = std::min<std::size_t>(size, packet[6]) * 8;
+            auto bits = [&](int count) {
+                std::uint32_t value = 0;
+                for (int bit = 0; bit < count && bit_at < end; ++bit, ++bit_at) value |= std::uint32_t(packet[bit_at / 8] >> (bit_at % 8) & 1) << bit;
+                return value;
+            };
+            // 8 bits a state (0xff ends), 1 bit it has stats, then a stat list
+            // as 0xa8's: 9 bits a stat id till 0x1ff, its param and value in
+            // ItemStatCost's send bits.
+            for (std::uint32_t state = 0; bit_at + 8 <= end && (state = bits(8)) != 0xff;) {
+                if (!std::ranges::contains(states, int(state))) states.push_back(int(state));
+                if (!bits(1)) continue;
+                for (std::uint32_t stat = 0; bit_at + 9 <= end && (stat = bits(9)) != 0x1ff;) {
+                    if (stat >= stat_send_bits.size() || stat_send_bits[stat].first <= 0) { bit_at = end; break; }   // widths unknown: the rest can't be read
+                    bits(stat_send_bits[stat].second);
+                    bits(stat_send_bits[stat].first);
+                }
+            }
+        }
+        break;
+    case 0x0d:   // a unit stops at x, y: +6 its unit command (0x13 hit, 8 dying, 9 dead)
+        if (size >= 11) place(unit_at(packet[1], read_u32(packet, 2)), read_u16(packet, 7), read_u16(packet, 9));
+        if (size >= 11 && packet[1] == 0 && read_u32(packet, 2) == self_id && packet[6] == 8) died = true;
+        break;
+    case 0x8c:   // player relation: +1 the player, +5 toward whom, +9 u16 flags (1 loot, 2 not heard, 4 squelched, 8 hostile)
+        if (size >= 11 && read_u32(packet, 1) == self_id) unit_at(0, read_u32(packet, 5)).flags = read_u16(packet, 9);
+        break;
+    case 0x8b:   // relationship: +1 the other player, +5 its state (the party button's, FUN_00479eb0)
+        if (size >= 6) unit_at(0, read_u32(packet, 1)).relation = packet[5];
+        // game.exe's player clicks the party button; d2d has none: it
+        // invites a player not yet asked (state 0: 6) and accepts an
+        // invite (2: 8) itself.
+        if (size >= 6 && auto_party && read_u32(packet, 1) != self_id && (packet[5] == 0 || packet[5] == 2)
+            && !(packet[5] == 0 && std::ranges::contains(no_auto_invite, read_u32(packet, 1)))) {
+            log.note(std::string(packet[5] == 0 ? "inviting " : "accepting the invite of ") + std::to_string(read_u32(packet, 1)));
+            send({ d2d::net::d2gs::c2s::party(packet[5] == 0 ? 6 : 8, read_u32(packet, 1)) });
+        }
+        break;
+    case 0x77:   // trade button action (FUN_004b8cf0): +1 what
+        if (size < 2) break;
+        if (packet[1] == 0x15) { cube_opened = true; break; }   // the Cube's open on the host (FUN_0048a460)
+        log.note("trade: action " + std::to_string(packet[1]) + " in state " + std::to_string(trade.state));
+        switch (packet[1]) {
+        case 0: if (trade.state == 0) trade.state = 1; break;                      // our request is out
+        case 1: if (trade.state == 0) trade.state = 2; break;                      // someone asks us
+        case 5: trade.state = trade.state == 7 ? 7 : 5; break;                     // they accepted
+        case 6:                                                                    // open; or a change takes the accepts back
+            if (trade.state == 1 || trade.state == 2) { trade.ours.clear(); store_items.clear(); }
+            trade.state = 3;
+            break;
+        case 2: case 0xc: case 0xd: {                                              // closed, done, cancelled: items settle
+            auto offered = std::move(trade.ours);
+            trade = {};
+            trade.ours = std::move(offered);
+            trade.settle_until = steady_ms() + 5000;
+            store_items.clear();
+            break;
+        }
+        default: break;
+        }
+        break;
+    case 0x78:   // trade with: +1 char[16] name, +0x11 u32 id (FUN_004b9010)
+        if (size >= 0x15) { trade.with_name = std::string(read_name(packet, 1, 16)); trade.with = read_u32(packet, 0x11); }
+        break;
+    case 0x79:   // trade gold: +1 1 ours / 0 theirs, +2 u32 (FUN_004b90d0)
+        if (size >= 6) (packet[1] ? trade.our_gold : trade.their_gold) = read_u32(packet, 2);
+        break;
+    case 0x82:   // portal owner: +1 owner, +5 name, +0x15 the end where we are, +0x19 the other (again on arriving: swapped)
+        if (size >= 0x1d && read_u32(packet, 1) == self_id) portal_here = read_u32(packet, 0x15);
+        break;
+    case 0x8e:   // corpse: +1 add (1) / remove, +2 its player, +6 the corpse's own player unit
+        if (size >= 10 && read_u32(packet, 2) == self_id) {
+            std::erase(corpses, read_u32(packet, 6));
+            if (packet[1] != 0) corpses.push_back(read_u32(packet, 6));
+        }
+        break;
+    case 0xac:   // assign monster: id, MonStats row, x, y, life
+        if (size >= 12) {
+            auto& unit = unit_at(1, read_u32(packet, 1));
+            unit.cls = read_u16(packet, 5);
+            place(unit, read_u16(packet, 7), read_u16(packet, 9));
+            unit.life = packet[0xb];
+            if (const auto boss = d2d::net::d2gs::s2c::monster_boss(packet, unit.cls >= 0 && std::size_t(unit.cls) < monster_parts.size() ? monster_parts[std::size_t(unit.cls)] : std::array<std::uint8_t, 16>{})) {
+                unit.boss_flags = boss->flags; unit.super = boss->super; unit.mods = boss->mods; unit.name_seed = boss->name_seed;
+            }
+        }
+        break;
+    case 0x67:   // monster to x, y; +0xd i16 its velocity % (0: unchanged)
+        if (size >= 15) {
+            auto& unit = unit_at(1, read_u32(packet, 1));
+            walk(unit, read_u16(packet, 6), read_u16(packet, 8));
+            if (const auto pct = std::int16_t(read_u16(packet, 0xd)); pct != 0) unit.velocity_pct = pct;
+        }
+        break;
+    case 0x68:   // monster to a unit (+0xa type, +0xb id), from where it is; +0x12 its velocity %
+        if (size >= 20) {
+            auto& unit = unit_at(1, read_u32(packet, 1));
+            place(unit, read_u16(packet, 6), read_u16(packet, 8));
+            if (const auto pct = std::int16_t(read_u16(packet, 0x12)); pct != 0) unit.velocity_pct = pct;
+            if (const auto target = units.find(key(packet[0xa], read_u32(packet, 0xb))); target != units.end() && &target->second != &unit)
+                walk(unit, target->second.x, target->second.y);   // ponytail: to where the target was, not following it
+        }
+        break;
+    case 0x6d:   // monster stops at x, y
+        if (size >= 10) { auto& unit = unit_at(1, read_u32(packet, 1)); place(unit, read_u16(packet, 5), read_u16(packet, 7)); unit.life = packet[9]; }
+        break;
+    case 0x4c:   // a skill on a unit: +1 caster type, +2 id, +6 u16 skill, +9 target type, +0xa id
+    case 0x4d:   // ... at x, y: +6 u32 skill, +0xb x, +0xd y
+        if (size >= 15 && packet[1] == 0 && read_u32(packet, 2) != self_id) {
+            auto& unit = unit_at(0, read_u32(packet, 2));
+            unit.skill = packet[0] == 0x4c ? read_u16(packet, 6) : int(read_u32(packet, 6));
+            unit.skill_ms = steady_ms();
+            unit.skill_x = unit.x; unit.skill_y = unit.y;
+            if (packet[0] == 0x4d) { unit.skill_x = read_u16(packet, 0xb); unit.skill_y = read_u16(packet, 0xd); }
+            else if (const auto target = units.find(key(packet[9], read_u32(packet, 0xa))); target != units.end()) { unit.skill_x = target->second.x; unit.skill_y = target->second.y; }
+        }
+        break;
+    case 0x2c:   // unit sound: +1 type, +2 u32 id, +6 u16 sound; a player's Say (0x19..0x20) plays its class's voice (FUN_004cb9c0)
+        if (size >= 8 && packet[1] == 0 && read_u32(packet, 2) != self_id && unsigned(read_u16(packet, 6) - 0x19) < 8)
+            if (const auto speaker = units.find(key(0, read_u32(packet, 2))); speaker != units.end()) phrases.push_back({ speaker->second.cls, read_u16(packet, 6) - 0x19 });
+        break;
+    case 0x26:   // chat / overhead: +1 type (1 to all, 2 a whisper, 5 overhead), +10 name\0, the message\0
+        if (size >= 12 && packet[1] == 5) {                   // +3 unit type, +4 id (FUN_0049f410)
+            const auto* text = reinterpret_cast<const char*>(packet.data());
+            const std::size_t message_at = 10 + strnlen(text + 10, size - 10) + 1;
+            if (message_at <= size) overheads.push_back({ packet[3], read_u32(packet, 4), std::string(text + message_at, strnlen(text + message_at, size - message_at)) });
+        }
+        if (size >= 12 && (packet[1] == 1 || packet[1] == 2)) {
+            const auto* text = reinterpret_cast<const char*>(packet.data());
+            const std::string name(text + 10, strnlen(text + 10, size - 10));
+            const std::size_t message_at = 10 + name.size() + 1;
+            if (message_at < size) chat.push_back({ packet[1], packet[8], name, std::string(text + message_at, strnlen(text + message_at, size - message_at)) });
+        }
+        break;
+    case 0x8d:   // assign party: +1 the player, +5 u16 party (0xffff none)
+        if (size >= 7) unit_at(0, read_u32(packet, 1)).party = read_u16(packet, 5);
+        break;
+    case 0x75:   // party roster: +1 the player, +5 u16 party, +7 u16 level
+        if (size >= 13) { auto& player = unit_at(0, read_u32(packet, 1)); player.party = read_u16(packet, 5); player.level = read_u16(packet, 7); }
+        break;
+    case 0x7f:   // party member: +1 is a player, +2 u16 life %, +4 the id, +8 u16 area
+        if (size >= 10 && packet[1] == 1) { auto& member = unit_at(0, read_u32(packet, 4)); member.party_life = read_u16(packet, 2); member.area = read_u16(packet, 8); }
+        break;
+    case 0x5a:   // an event message (FUN_0049eb10)
+        if (size >= 40) {
+            const auto* text = reinterpret_cast<const char*>(packet.data());
+            events.push_back({ packet[1], packet[2], packet[7], read_u32(packet, 3), std::string(text + 8, strnlen(text + 8, 16)),
+                               std::string(text + 0x18, strnlen(text + 0x18, 16)), read_u16(packet, 0x18) });
+        }
+        break;
+    case 0xab:   // heal: type, id, life
+        if (size >= 7) unit_at(packet[1], read_u32(packet, 2)).life = packet[6];
+        break;
+    case 0x63:   // the waypoint menu's open (FUN_0045e670): +1 its object, then our waypoints
+        if (size >= 5) waypoint_menu = read_u32(packet, 1);
+        break;
+    case 0x0a:   // remove: type, id (4: an item)
+        if (size >= 6) {
+            units.erase(key(packet[1], read_u32(packet, 2)));
+            if (packet[1] == 4) { ground.erase(read_u32(packet, 2)); own_items.erase(read_u32(packet, 2)); store_items.erase(read_u32(packet, 2)); }
+        }
+        break;
+    case 0x5c:   // a player leaves
+        if (size >= 5) units.erase(key(0, read_u32(packet, 1)));
+        break;
+    default:
+        break;
+    }
+}
+
+auto NetGame::move_to(float subtile_x, float subtile_y, bool run) -> void {
+    if (session.state() != d2d::net::JoinState::InGame || subtile_x < 0 || subtile_y < 0) return;
+    walk_goal_x = walk_goal_y = -1;
+    if (const float apart = std::hypot(subtile_x - host_x, subtile_y - host_y); (host_x > 0 || host_y > 0) && apart > kWalkReach) {
+        walk_goal_x = subtile_x; walk_goal_y = subtile_y; walk_goal_run = run;
+        subtile_x = host_x + (subtile_x - host_x) * kWalkReach / apart;
+        subtile_y = host_y + (subtile_y - host_y) * kWalkReach / apart;
+    }
+    send({ d2d::net::d2gs::c2s::move_to(std::uint16_t(subtile_x), std::uint16_t(subtile_y), run) });
+    walk_to_x = subtile_x;
+    walk_to_y = subtile_y;
+    walk_sent_ms = steady_ms();
+}
+
+auto NetGame::swap_weapons() -> void {
+    if (session.state() == d2d::net::JoinState::InGame) send({ d2d::net::d2gs::c2s::swap_weapons() });
+}
+
+auto NetGame::set_running(bool run) -> void {
+    if (session.state() == d2d::net::JoinState::InGame) send({ d2d::net::d2gs::c2s::set_running(run) });
+}
+
+auto NetGame::select(int skill, bool left) -> void {
+    auto& held = hand_skill[left ? 1 : 0];
+    if (held == skill) return;
+    held = skill;
+    send({ d2d::net::d2gs::c2s::select_skill(skill, left) });
+}
+
+auto NetGame::skill_at(int skill, bool left, float subtile_x, float subtile_y) -> void {
+    if (session.state() != d2d::net::JoinState::InGame || subtile_x < 0 || subtile_y < 0) return;
+    select(skill, left);
+    send({ d2d::net::d2gs::c2s::skill_at(left, std::uint16_t(subtile_x), std::uint16_t(subtile_y)) });
+}
+
+auto NetGame::skill_on(int skill, bool left, int type, std::uint32_t id) -> void {
+    if (session.state() != d2d::net::JoinState::InGame) return;
+    select(skill, left);
+    send({ d2d::net::d2gs::c2s::skill_on(left, std::uint32_t(type), id) });
+}
+
+auto NetGame::interact(int type, std::uint32_t id) -> void {
+    if (session.state() == d2d::net::JoinState::InGame) send({ d2d::net::d2gs::c2s::interact(std::uint32_t(type), id) });
+}
+
+auto NetGame::waypoint(std::uint32_t id, int level) -> void {
+    if (session.state() == d2d::net::JoinState::InGame) send({ d2d::net::d2gs::c2s::waypoint(id, std::uint16_t(level)) });
+}
+
+auto NetGame::pick_up(std::uint32_t id) -> void {
+    if (session.state() != d2d::net::JoinState::InGame) return;
+    picking = id;
+    send({ d2d::net::d2gs::c2s::pick_up(id) });
+}
+
+auto NetGame::host_item(const d2d::d2s::Item& local) const -> std::uint32_t {
+    using namespace d2d::d2s::item_location;
+    for (const auto& [id, item] : own_items) {
+        if (item.code != local.code || item.location != local.location) continue;
+        const bool same = local.location == kStored ? item.panel == local.panel && item.column == local.column && item.row == local.row
+                        : local.location == kEquipped ? item.slot == local.slot
+                        : local.location == kBelt ? item.column == local.column
+                        : true;                                    // the cursor holds one
+        if (same) return id;
+    }
+    return 0;
+}
+
+auto NetGame::nearest(int type, int cls, float subtile_x, float subtile_y, float within) const -> const Unit* {
+    const Unit* best = nullptr;
+    float best_distance = within;
+    for (const auto& [unit_key, unit] : units) {
+        if (unit.type != type || (cls >= 0 && unit.cls != cls)) continue;
+        const float distance = std::hypot(unit.x - subtile_x, unit.y - subtile_y);
+        if (distance <= best_distance) { best = &unit; best_distance = distance; }
+    }
+    return best;
+}
+
+auto NetGame::leave() -> void {
+    send(session.leave());
+    const auto until = steady_ms() + 1000;
+    while (!closed() && steady_ms() < until) pump(steady_ms(), 0);
+    d2d::log::info("net: left; {} unknown packets this game", log.unknown_count());
+    log.summary();
+}

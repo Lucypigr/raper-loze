@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1920 620">
+<!-- Steam hero (the game page's banner; Steam draws logo.png over it). -->
+<rect width="1920" height="620" fill="#1e1b1b"/>
+<image xlink:href="d2d.svg" x="1190" y="0" width="620" height="620"/>
+</svg>

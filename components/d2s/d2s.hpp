@@ -1,0 +1,170 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// D2Decomp .d2s character-save header parser.
+//
+// Reads only the fixed header the char-select screen needs: name, class,
+// level, status flags. Stable from 1.09 (version 92) through 1.14d (96).
+// unverified (source: the Phrozen Keep d2s spec): the layout; the data
+// agrees (19 real 1.14d saves, test_d2s). game.exe's reader not traced.
+//   +0x00 u32  magic 0xAA55AA55
+//   +0x04 u32  version
+//   +0x08 u32  file size
+//   +0x0C u32  checksum
+//   +0x10 u32  the weapon switch's set showing: 0 I, 1 II (the hands in
+//              body slots 4 / 5 are always the set in use)
+//   +0x14 char name[16], NUL-padded
+//   +0x24 u8   status  (0x04 hardcore, 0x08 died, 0x20 expansion)
+//   +0x25 u8   progression (acts/difficulties beaten; drives the title)
+//   +0x28 u8   class   (0 AM, 1 SO, 2 NE, 3 PA, 4 BA, 5 DZ, 6 AS)
+//   +0x2B u8   level
+//   +0x30 u32  last-played time (unix seconds) — char-select sort key
+//   +0x38 u32  hotkeys[16]: Skills.txt id, 0xffff none, | 0x8000 = to the left button
+//   +0x78 u32  left skill, +0x7C right skill, +0x80 / +0x84 the weapon-swap pair
+//   +0x88 u8   appearance[16]: per composite layer (HD TR LG RA LA RH LH
+//              SH S1..S8), an index into D2's component table (see
+//              components/compcode), 0xff = empty
+//   +0x98 u8   tints[16]: per-layer item colormap, 0xff = none
+//   +0xAB u32  map id: the last game's map seed (a single-player game
+//              reuses it on the difficulty last played, FUN_0056a090)
+//   +0xB1 u16  mercenary dead, +0xB3 u32 its seed (0 = no merc), +0xB7 u16
+//              name index, +0xB9 u16 type (hireling.txt Id), +0xBB u32 exp
+//   +0xA8 u8   difficulty[3]: normal/nightmare/hell; 0x80 = the one the
+//              character was last played on, low 3 bits = act
+//   +0x14F "Woo!" u32 version (6) u16 size (298), then per difficulty 96
+//              bytes of quest flags: 16 bits per quest, bit 0 = done —
+//              the game's own flag block (FUN_0065c310 tests bit
+//              quest*16 + n, LSB first; 1 Den of Evil .. 6 Andariel)
+//   +0x279 "WS" + 6 bytes, then per difficulty 24 bytes: 02 01 and a
+//              bitfield of activated waypoints (Levels.txt Waypoint
+//              index, LSB first; 39 used)
+//   +0x2C9 01 'w' 34 00 (FUN_00569490: u16 0x7701, u16 size 0x34), then
+//              per difficulty 8 bytes of NPC introductions heard (+0x2CD,
+//              FUN_00572520; bit = the 0x732738 table's, 31 Malah) and 8 of
+//              congratulations (+0x2E5, FUN_00572530)
+// Stats/skills/items, the bit-packed sections after 0x2FD: d2s_items.hpp.
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <span>
+#include <stdexcept>
+#include <string>
+
+namespace d2d::d2s {
+
+inline constexpr std::uint32_t kMagic = 0xAA55AA55;
+// The class id (header +0x28): charstats.txt's row order. Plain, so it
+// indexes the per-class tables.
+enum PlayerClass : int { kAmazon, kSorceress, kNecromancer, kPaladin, kBarbarian, kDruid, kAssassin };
+// D2R (97+) moved the name field; pre-1.09 used a different header.
+inline constexpr std::uint32_t kMinVersion = 92;
+inline constexpr std::uint32_t kMaxVersion = 96;
+
+struct Header {
+    std::uint32_t version = 0;
+    std::string   name;
+    std::uint8_t  status = 0;
+    std::uint8_t  progression = 0;
+    std::uint8_t  cls = 0;      // .d2s class id, see table above
+    std::uint8_t  level = 0;
+    std::uint32_t last_played = 0;
+    std::uint32_t weapon_set = 0;
+    std::array<std::uint32_t, 16> hotkeys{};
+    std::uint32_t left_skill = 0, right_skill = 0, left_swap = 0, right_swap = 0;
+    std::array<std::uint8_t, 16> appearance{};
+    std::array<std::uint8_t, 16> tints{};
+    // Both as one: the look d2d draws (0x88..0xa7).
+    [[nodiscard]] std::array<std::uint8_t, 32> look() const {
+        std::array<std::uint8_t, 32> gear_look{};
+        std::copy(appearance.begin(), appearance.end(), gear_look.begin());
+        std::copy(tints.begin(), tints.end(), gear_look.begin() + 16);
+        return gear_look;
+    }
+    void set_look(const std::array<std::uint8_t, 32>& look) {
+        std::copy(look.begin(), look.begin() + 16, appearance.begin());
+        std::copy(look.begin() + 16, look.end(), tints.begin());
+    }
+    std::array<std::uint8_t, 3>  difficulty{};
+    std::uint32_t map_id = 0;
+    std::array<std::array<std::uint8_t, 96>, 3> quests{};   // zero when the save has none
+    // The mercenary: seed 0 = none hired.
+    bool merc_dead = false;
+    std::uint32_t merc_seed = 0, merc_exp = 0;
+    std::uint16_t merc_name = 0, merc_type = 0;
+    [[nodiscard]] bool quest_flag(int diff, int quest, int bit) const noexcept {
+        const int bit_index = quest * 16 + bit;
+        if (diff < 0 || diff > 2 || bit_index < 0 || bit_index >= 96 * 8) return false;
+        return quests[std::size_t(diff)][std::size_t(bit_index >> 3)] >> (bit_index & 7) & 1;
+    }
+    std::array<std::array<std::uint8_t, 5>, 3> waypoints{};  // zero when the save has none
+    [[nodiscard]] bool waypoint(int diff, int waypoint_index) const noexcept {
+        if (diff < 0 || diff > 2 || waypoint_index < 0 || waypoint_index >= 40) return false;
+        return waypoints[std::size_t(diff)][std::size_t(waypoint_index >> 3)] >> (waypoint_index & 7) & 1;
+    }
+    std::array<std::uint64_t, 3> intros{};                     // zero when the save has none
+    // 0 normal, 1 nightmare, 2 hell — the last one played.
+    [[nodiscard]] int active_difficulty() const noexcept {
+        for (int i = 0; i < 3; ++i) if (difficulty[std::size_t(i)] & 0x80) return i;
+        return 0;
+    }
+    // 0..4: the act the character was last in, on that difficulty.
+    [[nodiscard]] int active_act() const noexcept {
+        return std::min(difficulty[std::size_t(active_difficulty())] & 0x07, 4);
+    }
+
+    [[nodiscard]] bool hardcore()  const noexcept { return status & 0x04; }
+    [[nodiscard]] bool died()      const noexcept { return status & 0x08; }
+    [[nodiscard]] bool expansion() const noexcept { return status & 0x20; }
+};
+
+// Throws std::runtime_error on anything that isn't a 1.09–1.14d save.
+// Saves are user-supplied files: validate before trusting any field.
+inline Header parse_header(std::span<const std::byte> bytes) {
+    constexpr std::size_t kHeaderEnd = 0xBF;   // through the merc fields
+    if (bytes.size() < kHeaderEnd) throw std::runtime_error("d2s: truncated header");
+    auto rd32 = [&](std::size_t off) {
+        std::uint32_t value; std::memcpy(&value, bytes.data() + off, 4); return value;
+    };
+    if (rd32(0x00) != kMagic) throw std::runtime_error("d2s: bad magic");
+
+    Header header;
+    header.version = rd32(0x04);
+    if (header.version < kMinVersion || header.version > kMaxVersion)
+        throw std::runtime_error("d2s: unsupported version "
+                                 + std::to_string(header.version));
+
+    const auto* name = reinterpret_cast<const char*>(bytes.data() + 0x14);
+    header.name.assign(name, strnlen(name, 16));
+    if (header.name.empty()) throw std::runtime_error("d2s: empty name");
+
+    header.status      = std::uint8_t(bytes[0x24]);
+    header.progression = std::uint8_t(bytes[0x25]);
+    header.cls         = std::uint8_t(bytes[0x28]);
+    header.level       = std::uint8_t(bytes[0x2B]);
+    header.last_played = rd32(0x30);
+    header.weapon_set  = rd32(0x10);
+    for (std::size_t i = 0; i < 16; ++i) header.hotkeys[i] = rd32(0x38 + i * 4);
+    header.left_skill = rd32(0x78); header.right_skill = rd32(0x7C); header.left_swap = rd32(0x80); header.right_swap = rd32(0x84);
+    std::memcpy(header.appearance.data(), bytes.data() + 0x88, 16);
+    std::memcpy(header.tints.data(),      bytes.data() + 0x98, 16);
+    std::memcpy(header.difficulty.data(), bytes.data() + 0xA8, 3);
+    auto rd16 = [&](std::size_t off) { std::uint16_t value; std::memcpy(&value, bytes.data() + off, 2); return value; };
+    header.map_id    = rd32(0xAB);
+    header.merc_dead = rd16(0xB1) != 0;
+    header.merc_seed = rd32(0xB3);
+    header.merc_name = rd16(0xB7);
+    header.merc_type = rd16(0xB9);
+    header.merc_exp  = rd32(0xBB);
+    if (bytes.size() >= 0x159 + 3 * 96 && std::memcmp(bytes.data() + 0x14F, "Woo!", 4) == 0)
+        for (std::size_t difficulty = 0; difficulty < 3; ++difficulty) std::memcpy(header.quests[difficulty].data(), bytes.data() + 0x159 + difficulty * 96, 96);
+    if (bytes.size() >= 0x281 + 3 * 24 && std::memcmp(bytes.data() + 0x279, "WS", 2) == 0)
+        for (std::size_t difficulty = 0; difficulty < 3; ++difficulty) std::memcpy(header.waypoints[difficulty].data(), bytes.data() + 0x283 + difficulty * 24, 5);
+    if (bytes.size() >= 0x2E5 && bytes[0x2CA] == std::byte{ 'w' })
+        for (std::size_t difficulty = 0; difficulty < 3; ++difficulty) std::memcpy(&header.intros[difficulty], bytes.data() + 0x2CD + difficulty * 8, 8);
+    if (header.cls > 6) throw std::runtime_error("d2s: bad class " + std::to_string(header.cls));
+    return header;
+}
+
+}  // namespace d2d::d2s
