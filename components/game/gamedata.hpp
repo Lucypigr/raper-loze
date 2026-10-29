@@ -748,7 +748,9 @@ inline std::string u16_to_latin1(std::u16string_view text) {
         // Keep printable Latin-1 (0x20..0xFF) and line breaks (two-line
         // labels like "Fire\nResistance"), drop the rest — D2 UI strings
         // are ASCII with occasional accented chars, all inside Latin-1.
+        // A Chinese table's characters stay, as tbl::append_char marks them.
         if ((code_unit >= 0x20 && code_unit <= 0xFF) || code_unit == '\n') out.push_back(char(code_unit));
+        else if (code_unit > 0xFF && (code_unit < 0xD800 || code_unit > 0xDFFF)) d2d::tbl::append_char(out, code_unit);
     }
     return out;
 }

@@ -1690,6 +1690,8 @@ int main(int argc, char** argv) {
     app.add_flag  ("--no-video", no_video, "Skip the startup cinematics");
     std::string join_host, game_exe, log_level = "info";
     app.add_option("--log-level", log_level, "error, warning, info, debug or trace");
+    std::string language = cfg.contains("language") ? cfg["language"] : "ENG";
+    app.add_option("--language", language, "The strings' language folder (ENG, CHI...; also `language =` in d2d.cfg); CHI reads a text patch's data\\local\\lng\\chi beside the MPQs");
     app.add_option("--join", join_host, "Join a game.exe TCP/IP game at this address (your own network only)");
     app.add_option("--game-exe", game_exe, "Your 1.14d game.exe, for --join (else $D2_GAME_EXE, game.exe or bin/game.exe beside the MPQs)");
     int start_cam_x = -1, start_cam_y = -1;
@@ -1738,7 +1740,7 @@ int main(int argc, char** argv) {
 
     std::vector<std::uint8_t> framebuffer(std::size_t(kScreenWidth) * kScreenHeight * 4, 0);
     for (std::size_t i = 3; i < framebuffer.size(); i += 4) framebuffer[i] = 0xFF;
-    auto scene = load_scene(data_dir, patch_layer);   // the menus' part; nullopt if the MPQs won't load
+    auto scene = load_scene(data_dir, patch_layer, language);   // the menus' part; nullopt if the MPQs won't load
     // Nothing to run without them: say so (the log has which MPQ and why)
     // rather than go on to a game with no data.
     if (!scene) {

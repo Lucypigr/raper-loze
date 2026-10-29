@@ -2,7 +2,10 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <!-- D2Decomp in the browser: the player picks their own Diablo II MPQs, which
      go into the in-memory /d2 folder; d2d then runs with --data /d2. Nothing
-     is uploaded anywhere. Saves and d2d.cfg persist in IndexedDB (/save). -->
+     is uploaded anywhere. Saves and d2d.cfg persist in IndexedDB (/save).
+     Optionally a Chinese text patch's string tables (lng\chi\*.tbl): kept in
+     IndexedDB (d2d-chinese), copied to /d2/data/local/lng/chi, and d2d runs with
+     --language CHI (their characters draw in the built-in Cubic 11). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -17,6 +20,7 @@
   label.button:hover { background: #2a2416; }
   input[type=file] { display: none; }
   #status { margin-top: 16px; white-space: pre-wrap; color: #ddd; }
+  h2 { font-size: 17px; font-weight: 600; margin-top: 28px; }
   #canvas { display: none; width: 100vw; height: 100vh; object-fit: contain; touch-action: none; }
   body.playing #setup { display: none; }
   body.playing #canvas { display: block; }
@@ -33,6 +37,13 @@
   <label class="button">Choose .mpq files<input id="pick-files" type="file" accept=".mpq,.MPQ" multiple></label>
   <p><small>Needed: d2data, d2exp, d2char, d2sfx, d2speech, d2music, d2xmusic, d2xtalk,
      d2video, d2xvideo and patch_d2 (.mpq). About 2 GB of memory is used.</small></p>
+  <h2>中文 Chinese text</h2>
+  <p>Optional: a Chinese text patch's folder (the one holding <code>data\local\lng\chi</code>,
+     with <code>string.tbl</code>, <code>expansionstring.tbl</code>, <code>patchstring.tbl</code>).
+     It's remembered on this device. 選擇中文補丁資料夾（只需一次）。</p>
+  <label class="button">Choose Chinese patch 選擇中文補丁<input id="pick-chinese" type="file" webkitdirectory multiple></label>
+  <label><input id="use-chinese" type="checkbox" disabled> 使用中文 Use Chinese</label>
+  <div id="chinese-status"><small>No Chinese patch yet. 尚未選擇中文補丁。</small></div>
   <div id="status"></div>
 </div>
 <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
@@ -52,6 +63,55 @@ async function ensureIsolated() {
     location.reload();
   }
   return registration && window.crossOriginIsolated;
+}
+
+// The Chinese patch's tables, kept in this device's IndexedDB (the same
+// database d2d's saves are in, opened here before the engine starts).
+const kTables = ["string.tbl", "expansionstring.tbl", "patchstring.tbl"];
+const tableStore = () => new Promise((resolve, reject) => {
+  const request = indexedDB.open("d2d-chinese", 1);
+  request.onupgradeneeded = () => request.result.createObjectStore("tables");
+  request.onsuccess = () => resolve(request.result);
+  request.onerror = () => reject(request.error);
+});
+async function storedTables() {
+  const db = await tableStore();
+  return new Promise((resolve) => {
+    const tables = {};
+    const store = db.transaction("tables").objectStore("tables");
+    let left = kTables.length;
+    for (const name of kTables) {
+      const request = store.get(name);
+      request.onsuccess = () => { if (request.result) tables[name] = request.result; if (--left === 0) resolve(tables); };
+      request.onerror = () => { if (--left === 0) resolve(tables); };
+    }
+  });
+}
+async function storeTables(fileList) {
+  // The lng/chi tables (a patch folder may hold other languages' too).
+  const files = [...fileList].filter((file) => kTables.includes(file.name.toLowerCase()));
+  const chinese = files.filter((file) => /(^|\/)chi\//i.test(file.webkitRelativePath));
+  const picked = chinese.length ? chinese : files;
+  if (!picked.length) throw new Error("No string.tbl / expansionstring.tbl / patchstring.tbl in that folder. 資料夾裡找不到 .tbl 檔。");
+  if (new Set(picked.map((file) => file.name.toLowerCase())).size < picked.length)
+    throw new Error("That folder holds several versions of the patch: choose one of them. 這個資料夾裡有好幾個版本，請只選其中一個版本的資料夾。");
+  // Read first: a transaction ends at the first await that isn't its own.
+  const tables = await Promise.all(picked.map(async (file) => [file.name.toLowerCase(), new Uint8Array(await file.arrayBuffer())]));
+  const db = await tableStore();
+  const transaction = db.transaction("tables", "readwrite");
+  const store = transaction.objectStore("tables");
+  store.clear();   // one version's tables, never mixed with another's
+  for (const [name, data] of tables) store.put(data, name);
+  await new Promise((resolve, reject) => { transaction.oncomplete = resolve; transaction.onerror = () => reject(transaction.error); });
+}
+async function showChinese() {
+  const names = Object.keys(await storedTables());
+  const box = document.getElementById("use-chinese");
+  box.disabled = names.length === 0;
+  box.checked = names.length > 0 && localStorage.getItem("d2d-language") !== "ENG";
+  document.getElementById("chinese-status").innerHTML = names.length
+    ? `<small>Chinese patch ready 中文補丁已就緒: ${names.join(", ")}</small>`
+    : "<small>No Chinese patch yet. 尚未選擇中文補丁。</small>";
 }
 
 async function start(fileList) {
@@ -76,6 +136,13 @@ async function start(fileList) {
     const data = new Uint8Array(await file.arrayBuffer());
     FS.writeFile("/d2/" + file.name.toLowerCase(), data, { canOwn: true });
   }
+  const args = ["--data", "/d2"];
+  if (document.getElementById("use-chinese").checked) {
+    const tables = await storedTables();
+    FS.mkdirTree("/d2/data/local/lng/chi");
+    for (const [name, data] of Object.entries(tables)) FS.writeFile("/d2/data/local/lng/chi/" + name, data);
+    args.push("--language", "CHI");
+  }
   // Saves and settings: IndexedDB at /save, written back every few seconds.
   FS.mkdir("/save");
   FS.mount(module.IDBFS, {}, "/save");
@@ -85,12 +152,19 @@ async function start(fileList) {
 
   document.body.classList.add("playing");
   document.getElementById("canvas").focus();
-  module.callMain(["--data", "/d2"]);
+  module.callMain(args);
 }
 
 for (const id of ["pick-dir", "pick-files"])
   document.getElementById(id).addEventListener("change", (event) =>
     start(event.target.files).catch((error) => { document.body.classList.remove("playing"); status(String(error)); }));
+
+document.getElementById("pick-chinese").addEventListener("change", (event) =>
+  storeTables(event.target.files).then(() => { localStorage.removeItem("d2d-language"); return showChinese(); })
+    .catch((error) => { document.getElementById("chinese-status").textContent = String(error.message || error); }));
+document.getElementById("use-chinese").addEventListener("change", (event) =>
+  localStorage.setItem("d2d-language", event.target.checked ? "CHI" : "ENG"));
+showChinese().catch(() => {});
 
 ensureIsolated().then((isolated) => {
   if (!isolated) status("This browser can't give the page shared memory (cross-origin isolation); d2d needs it for its threads.");

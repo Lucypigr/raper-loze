@@ -33,8 +33,11 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1537,7 +1540,8 @@ void check_patch_layer(const d2d::mpq::Stack& mpqs) {
 
 }  // namespace
 
-std::optional<GameData> open_game_data(const fs::path& data_dir, const fs::path& patch_installer, bool tile_pixels) {
+std::optional<GameData> open_game_data(const fs::path& data_dir, const fs::path& patch_installer, bool tile_pixels,
+                                       std::string_view language) {
     // MPQ names match case-insensitively (D2DATA.MPQ in Wine prefixes and
     // Linux copies); the install is read in place, never renamed.
     auto find = [&](std::string_view name) { return d2d::install::find_file(data_dir, name); };
@@ -1618,18 +1622,34 @@ std::optional<GameData> open_game_data(const fs::path& data_dir, const fs::path&
         // string.tbl directly; when a subsystem needs a patch-shifted
         // entry, load all three and query in order (patch → expansion →
         // base).
-        game_data.strings = [&] {
-                auto bytes = mpqs.try_read(R"(data\local\LNG\ENG\string.tbl)");
-                return bytes ? d2d::tbl::Table(*bytes) : d2d::tbl::Table{};
-            }();
-        game_data.patch_strings = [&] {
-                auto bytes = mpqs.try_read(R"(data\local\LNG\ENG\patchstring.tbl)");
-                return bytes ? d2d::tbl::Table(*bytes) : d2d::tbl::Table{};
-            }();
-        game_data.exp_strings = [&] {
-                auto bytes = mpqs.try_read(R"(data\local\LNG\ENG\expansionstring.tbl)");
-                return bytes ? d2d::tbl::Table(*bytes) : d2d::tbl::Table{};
-            }();
+        // Another language (d2d.cfg `language =`, say CHI): its table as a
+        // loose file under data_dir (data\local\lng\<language>\, where a
+        // text patch's data folder lands), else in the MPQs, else ENG's.
+        const auto loose_dir = [&]() -> std::optional<fs::path> {
+            fs::path dir = data_dir;
+            for (std::string_view part : { std::string_view("data"), std::string_view("local"), std::string_view("lng"), language }) {
+                const auto next = d2d::install::find_file(dir, part);
+                if (!next) return std::nullopt;
+                dir = *next;
+            }
+            return dir;
+        }();
+        const auto strings = [&](std::string_view name) {
+            if (loose_dir)
+                if (const auto path = d2d::install::find_file(*loose_dir, name)) {
+                    std::ifstream file(*path, std::ios::binary);
+                    const std::vector<char> chars{ std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>() };
+                    d2d::log::info("  Strings: {}", path->string());
+                    return d2d::tbl::Table(std::as_bytes(std::span(chars)));
+                }
+            for (std::string_view folder : { language, std::string_view("ENG") })
+                if (auto bytes = mpqs.try_read(std::format(R"(data\local\LNG\{}\{})", folder, name)))
+                    return d2d::tbl::Table(*bytes);
+            return d2d::tbl::Table{};
+        };
+        game_data.strings = strings("string.tbl");
+        game_data.patch_strings = strings("patchstring.tbl");
+        game_data.exp_strings = strings("expansionstring.tbl");
         d2d::log::info("Opened the MPQs and strings ({} ms)", d2d::log::ms() - start_ms);
         game_data.patched = patched;
         game_data.data_dir = data_dir;

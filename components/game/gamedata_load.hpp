@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <string_view>
 
 namespace d2d::game {
 
@@ -22,7 +23,9 @@ std::optional<GameData> load_game_data(const fs::path& data_dir, const fs::path&
 // load_game_data in steps, so the menus can come up first: the MPQs and the
 // strings; then every table; then Act 1 for map_seed with its units,
 // monsters and skills (after the tables: a save's seed needs them read).
-std::optional<GameData> open_game_data(const fs::path& data_dir, const fs::path& patch_installer, bool tile_pixels = false);
+// language: the strings' LNG folder (ENG, CHI...); a table it lacks is ENG's.
+std::optional<GameData> open_game_data(const fs::path& data_dir, const fs::path& patch_installer, bool tile_pixels = false,
+                                       std::string_view language = "ENG");
 void load_game_tables(GameData& data, const d2d::mpq::Stack& mpqs);
 void load_game_world(GameData& data, d2d::mpq::Stack& mpqs, std::uint32_t map_seed);
 

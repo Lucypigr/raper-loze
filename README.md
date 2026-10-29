@@ -110,6 +110,15 @@ read into memory (about 2 GB), so a desktop browser is the target; phones may
 run out of memory. Saves persist in the browser's IndexedDB. Joining a game
 over TCP/IP is not available in a browser.
 
+## Chinese text (experimental)
+
+An English install can show a Chinese text patch's strings: `--language CHI`
+(or `language = CHI` in `d2d.cfg`) reads its `data\local\lng\chi\*.tbl`
+from beside the MPQs, and the characters D2's fonts lack draw in the built-in
+[Cubic 11](https://github.com/ACh-K/Cubic-11) pixel font (SIL OFL,
+`assets/fonts`). The browser page takes the patch folder too. Text drawn
+into images (menu buttons, area banners) stays English.
+
 ## Build and run
 
 You'll need a C++26 compiler, CMake 3.28+, Ninja, SDL3, OpenAL, zlib, libcurl

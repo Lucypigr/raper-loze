@@ -71,6 +71,35 @@ private:
         std::uint16_t value; std::memcpy(&value, source, 2); return value;
     }
 
+    // UTF-8 (BMP: up to three bytes) into `out`. False, `out` untouched,
+    // when `raw` isn't UTF-8 or is plain ASCII (Latin-1 reads it the same).
+    static bool decode_utf8(std::span<const unsigned char> raw, std::u16string& out) {
+        std::u16string text;
+        text.reserve(raw.size());
+        bool multi_byte = false;
+        for (std::size_t at = 0; at < raw.size();) {
+            const unsigned char lead = raw[at];
+            int extra = 0;
+            char32_t code = lead;
+            if (lead >= 0xE0 && lead < 0xF0) { extra = 2; code = lead & 0x0F; }
+            else if (lead >= 0xC2 && lead < 0xE0) { extra = 1; code = lead & 0x1F; }
+            else if (lead >= 0x80) return false;
+            if (at + std::size_t(extra) >= raw.size() && extra > 0) return false;   // cut short
+            for (int i = 1; i <= extra; ++i) {
+                const unsigned char next = raw[at + std::size_t(i)];
+                if ((next & 0xC0) != 0x80) return false;
+                code = (code << 6) | (next & 0x3F);
+            }
+            if (extra == 2 && code < 0x800) return false;   // overlong
+            multi_byte |= extra > 0;
+            text.push_back(char16_t(code));
+            at += std::size_t(extra) + 1;
+        }
+        if (!multi_byte) return false;
+        out = std::move(text);
+        return true;
+    }
+
     void parse(std::span<const std::byte> bytes) {
         constexpr std::size_t kHeader = 21;
         constexpr std::size_t kNode   = 17;
@@ -102,17 +131,17 @@ private:
             while (keyLen < keyMax && keyp[keyLen] != '\0') ++keyLen;
 
             // D2 stores values as single-byte (Latin-1 / Windows-1252 for
-            // LATIN builds; a locale-specific MBCS for CYR/JPN/KOR). Non-LATIN
-            // builds aren't handled here yet — treat every byte as Latin-1 for
-            // now. unverified (source: OpenD2's Latin path): the encoding.
-            // ponytail: Latin-1 only; add MBCS decode when a non-Latin TBL fails.
+            // LATIN builds; a locale-specific MBCS for CYR/JPN/KOR). The
+            // Chinese (CHI) tables 1.14d-era text patches ship are UTF-8,
+            // "ÿc" colour codes included: a value that is valid UTF-8 with a
+            // multi-byte sequence decodes as UTF-8, any other as Latin-1, so
+            // the English tables read as before. unverified (source:
+            // OpenD2's Latin path): the LATIN encoding.
             if (valLen == 0 || valOff + std::size_t(valLen) > bytes.size()) continue;
             const auto* valp = reinterpret_cast<const unsigned char*>(bytes.data() + valOff);
+            const std::span<const unsigned char> raw(valp, std::size_t(valLen - 1));   // skip trailing NUL
             std::u16string value;
-            value.reserve(valLen - 1);
-            for (std::uint16_t j = 0; j + 1 < valLen; ++j) {  // skip trailing NUL
-                value.push_back(char16_t(valp[j]));
-            }
+            if (!decode_utf8(raw, value)) value.assign(raw.begin(), raw.end());
 
             // Nodes carry a 16-bit `Index` at offset +0x01 — that's D2's ID.
             // Stash the value under it too so callers can look up by either.
@@ -125,5 +154,31 @@ private:
     std::unordered_map<std::string, std::u16string>   entries_;
     std::unordered_map<std::uint16_t, std::u16string> by_id_;
 };
+
+// The game's text strings are Latin-1, one byte a character, as D2's own
+// fonts draw them. A character past 0xFF (a Chinese table's) goes in as
+// kWide and three bytes 0x80 | six bits, high first: never NUL, '\n' or ' ',
+// so splitting lines and words leaves it whole, and it only means a wide
+// character after kWide (the Latin-1 conversion drops control codes).
+inline constexpr char kWide = '\x01';
+
+inline void append_char(std::string& text, char16_t code) {
+    if (code <= 0xFF) { text.push_back(char(code)); return; }
+    text.push_back(kWide);
+    text.push_back(char(0x80 | (code >> 12)));
+    text.push_back(char(0x80 | ((code >> 6) & 0x3F)));
+    text.push_back(char(0x80 | (code & 0x3F)));
+}
+
+// The character at `at`, stepping past it. A kWide cut short reads as 0.
+inline char16_t next_char(std::string_view text, std::size_t& at) {
+    const auto lead = static_cast<unsigned char>(text[at++]);
+    if (lead != static_cast<unsigned char>(kWide)) return lead;
+    if (at + 3 > text.size()) { at = text.size(); return 0; }
+    const auto byte = [&](std::size_t i) { return char16_t(static_cast<unsigned char>(text[at + i]) & 0x3F); };
+    const auto code = char16_t((byte(0) << 12) | (byte(1) << 6) | byte(2));
+    at += 3;
+    return code;
+}
 
 }  // namespace d2d::tbl

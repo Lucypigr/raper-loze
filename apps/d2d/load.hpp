@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <string_view>
 #include <string>
 #include <vector>
 
@@ -50,8 +51,9 @@ void load_saves(Scene& scene, const fs::path& dir);
 void load_act_palettes(Scene& scene, const d2d::mpq::Stack& mpqs, int act);
 
 // The MPQs and strings (open_game_data) and the menus' sprites, fonts and
-// palettes: enough for the title. nullopt: no game data.
-std::optional<Scene> load_scene(const fs::path& data_dir, const fs::path& patch_installer);
+// palettes: enough for the title. nullopt: no game data. language: the
+// strings' (open_game_data); its characters past 0xFF draw in Cubic 11.
+std::optional<Scene> load_scene(const fs::path& data_dir, const fs::path& patch_installer, std::string_view language = "ENG");
 // The rest, off the main thread while the title shows: every table, the
 // saves, Act 1 on the first save's map (save_seed) else map_seed, the game's
 // sprites and palettes. Nothing may read those until it returns.

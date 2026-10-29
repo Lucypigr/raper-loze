@@ -3,10 +3,12 @@
 #include "load.hpp"
 
 #include "common.hpp"
+#include "d2d_cjk_font.hpp"
 #include "gamemenu.hpp"
 #include "scene.hpp"
 #include "ui.hpp"
 
+#include <cjk.hpp>
 #include <compcode.hpp>
 #include <d2s.hpp>
 #include <d2s_items.hpp>
@@ -402,8 +404,11 @@ void load_saves(Scene& scene, const fs::path& dir) {
     d2d::log::info("Characters: {} in {}", scene.saves.size(), dir.string());
 }
 
-std::optional<Scene> load_scene(const fs::path& data_dir, const fs::path& patch_installer) {
-    auto data = game::open_game_data(data_dir, patch_installer, /*tile_pixels=*/true);
+std::optional<Scene> load_scene(const fs::path& data_dir, const fs::path& patch_installer, std::string_view language) {
+    // Cubic 11's glyphs for characters D2's fonts haven't (a CHI table's).
+    static const d2d::font::CjkFont cjk_font(kCjkFont);
+    d2d::font::cjk_fallback() = &cjk_font;
+    auto data = game::open_game_data(data_dir, patch_installer, /*tile_pixels=*/true, language);
     if (!data) return std::nullopt;
     const auto start_ms = d2d::log::ms();
     try {

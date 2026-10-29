@@ -21,9 +21,14 @@
 // (JPN/KOR/CYR) use the same layout with different codepoints.
 #pragma once
 
+#include "cjk.hpp"
+
 #include <dc6.hpp>
 #include <palette.hpp>
+#include <tbl.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -51,6 +56,7 @@ public:
     Font(std::span<const std::byte> tbl_bytes, dc6::Sprite sheet)
         : sheet_(std::move(sheet)) {
         parse_tbl(tbl_bytes);
+        measure_letters();
     }
 
     [[nodiscard]] const dc6::Sprite& sheet() const noexcept { return sheet_; }
@@ -65,9 +71,14 @@ public:
     }
 
     // Total advance width of `text` (single-line — no newline handling yet).
+    // Characters past 0xFF (tbl::kWide) measure in the CJK fallback.
     [[nodiscard]] int measure(std::string_view text) const {
         int width = 0;
-        for (unsigned char letter : text) if (auto* glyph = find(letter)) width += glyph->width;
+        for (std::size_t at = 0; at < text.size();) {
+            const auto code = d2d::tbl::next_char(text, at);
+            if (code > 0xFF) { if (const auto* wide = cjk_glyph(code)) width += wide->advance * cjk_scale(); }
+            else if (auto* glyph = find(code)) width += glyph->width;
+        }
         return width;
     }
 
@@ -94,8 +105,16 @@ public:
                     int x, int y, std::string_view text,
                     std::uint8_t tint_red, std::uint8_t tint_green, std::uint8_t tint_blue,
                     int clip_y0 = 0, int clip_y1 = 1 << 30) const {
-        for (unsigned char letter : text) {
-            const auto* glyph = find(letter);
+        for (std::size_t at = 0; at < text.size();) {
+            const auto code = d2d::tbl::next_char(text, at);
+            if (code > 0xFF) {
+                if (const auto* wide = cjk_glyph(code)) {
+                    blit_cjk(framebuffer, fbW, fbH, pal, *wide, x, y, tint_red, tint_green, tint_blue, clip_y0, clip_y1);
+                    x += wide->advance * cjk_scale();
+                }
+                continue;
+            }
+            const auto* glyph = find(code);
             if (!glyph) continue;
             const auto& frame = sheet_.frame(0, glyph->frame);
             blit_glyph_tinted(framebuffer, fbW, fbH, pal, frame, x, y, tint_red, tint_green, tint_blue, clip_y0, clip_y1);
@@ -105,6 +124,57 @@ public:
     }
 
 private:
+    [[nodiscard]] static const CjkFont::Glyph* cjk_glyph(std::uint16_t code) {
+        const auto* fallback = cjk_fallback();
+        return fallback ? fallback->find(code) : nullptr;
+    }
+
+    // Whole multiples keep the fallback's pixels square: 1x in the small
+    // and mid fonts, 2x in Font24/Font30, 3x in Font42.
+    [[nodiscard]] int cjk_scale() const {
+        return line_height_ >= 36 ? 3 : line_height_ >= 22 ? 2 : 1;
+    }
+
+    // The fallback's glyphs in this font's ink (its letters' commonest
+    // colour), their bottom row on the bottom of its capitals.
+    void blit_cjk(std::vector<std::uint8_t>& framebuffer, std::uint32_t fbW, std::uint32_t fbH,
+                  const palette::Palette& pal, const CjkFont::Glyph& glyph, int dst_x, int dst_y,
+                  std::uint8_t tint_red, std::uint8_t tint_green, std::uint8_t tint_blue,
+                  int clip_y0, int clip_y1) const {
+        const auto& fallback = *cjk_fallback();
+        const int scale = cjk_scale();
+        const int top = dst_y + cap_height_ - fallback.height() * scale;
+        const auto colour = pal[ink_];
+        for (int glyph_y = 0; glyph_y < fallback.height() * scale; ++glyph_y) {
+            const int pixel_y = top + glyph_y;
+            if (pixel_y < 0 || std::uint32_t(pixel_y) >= fbH || pixel_y < clip_y0 || pixel_y >= clip_y1) continue;
+            for (int glyph_x = 0; glyph_x < glyph.advance * scale; ++glyph_x) {
+                const int pixel_x = dst_x + glyph_x;
+                if (pixel_x < 0 || std::uint32_t(pixel_x) >= fbW || !fallback.pixel(glyph, glyph_x / scale, glyph_y / scale)) continue;
+                auto* pixel = &framebuffer[(std::size_t(pixel_y) * fbW + std::uint32_t(pixel_x)) * 4];
+                pixel[0] = std::uint8_t(int(colour.r) * tint_red / 255);
+                pixel[1] = std::uint8_t(int(colour.g) * tint_green / 255);
+                pixel[2] = std::uint8_t(int(colour.b) * tint_blue / 255);
+                pixel[3] = colour.a;
+            }
+        }
+    }
+
+    // ink_ and cap_height_ from the capitals' glyphs, for blit_cjk.
+    void measure_letters() {
+        std::array<int, 256> uses{};
+        for (std::uint16_t letter = 'A'; letter <= 'Z'; ++letter) {
+            const auto* glyph = find(letter);
+            if (!glyph || glyph->frame >= sheet_.total_frames()) continue;
+            const auto& frame = sheet_.frame(0, glyph->frame);
+            if (letter == 'A') cap_height_ = int(frame.height);
+            for (const auto index : frame.pixels) if (index != 0) ++uses[index];
+        }
+        const auto commonest = std::ranges::max_element(uses);
+        if (*commonest > 0) ink_ = std::uint8_t(commonest - uses.begin());
+        if (cap_height_ == 0) cap_height_ = line_height_;
+    }
+
     static void blit_glyph_tinted(std::vector<std::uint8_t>& framebuffer,
                                   std::uint32_t fbW, std::uint32_t fbH,
                                   const palette::Palette& pal,
@@ -161,6 +231,8 @@ private:
     std::unordered_map<std::uint16_t, Glyph> glyphs_;
     dc6::Sprite sheet_;
     int         line_height_ = 0;
+    int         cap_height_ = 0;     // 'A''s frame: where blit_cjk's glyphs stand
+    std::uint8_t ink_ = 255;         // the letters' commonest palette index
 };
 
 }  // namespace d2d::font

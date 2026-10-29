@@ -28,6 +28,8 @@ d2d_add_test(test_steam_shortcuts steam_shortcuts)
 d2d_add_test(test_screenshot screenshot)   # zlib transitive via screenshot
 d2d_add_test(test_palette mpq palette)
 d2d_add_test(test_font mpq font)
+d2d_add_test(test_cjk font)
+target_compile_definitions(test_cjk PRIVATE D2D_CJK_FONT="${PROJECT_SOURCE_DIR}/assets/fonts/cubic11.cjk")
 d2d_add_test(test_d2s d2s mpq compcode)
 d2d_add_test(test_automap d2s)
 d2d_add_test(test_protocol game)

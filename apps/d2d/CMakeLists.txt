@@ -197,6 +197,15 @@ string(REGEX REPLACE "(..)" "0x\\1," icon_bytes "${icon_hex}")
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/d2d_icon.hpp" CONTENT
     "#pragma once\n// generated from assets/icon/d2d.bmp\ninline constexpr unsigned char kIconBmp[] = {${icon_bytes}};\n")
 
+# Cubic 11's glyphs (OFL, assets/fonts) for characters past D2's fonts:
+# a Chinese text patch's strings. Built in, like the icon.
+set(cjk_font "${PROJECT_SOURCE_DIR}/assets/fonts/cubic11.cjk")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${cjk_font}")
+file(READ "${cjk_font}" cjk_hex HEX)
+string(REGEX REPLACE "(..)" "0x\\1," cjk_bytes "${cjk_hex}")
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/d2d_cjk_font.hpp" CONTENT
+    "#pragma once\n// generated from assets/fonts/cubic11.cjk\ninline constexpr unsigned char kCjkFont[] = {${cjk_bytes}};\n")
+
 # The log's preamble (main.cpp): git hash, branch, exact tag ("null" off
 # one) and build date, restamped on each commit / checkout (the launcher's
 # CONFIGURE_DEPENDS on .git/logs/HEAD). A CI checkout is a detached HEAD:
