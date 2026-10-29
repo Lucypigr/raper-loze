@@ -36,14 +36,19 @@
      <code>d2data.mpq</code>, or the <code>.mpq</code> files themselves.
      The files stay on this device; nothing is uploaded.</p>
   <label class="button">Choose folder<input id="pick-dir" type="file" webkitdirectory multiple></label>
-  <label class="button">Choose .mpq files<input id="pick-files" type="file" accept=".mpq,.MPQ" multiple></label>
+  <label class="button">Choose .mpq files<input id="pick-files" type="file" multiple></label>
   <p><small>Needed: d2data, d2exp, d2char, d2sfx, d2speech, d2music, d2xmusic, d2xtalk,
      d2video, d2xvideo and patch_d2 (.mpq). About 2 GB of memory is used.</small></p>
   <h2>中文 Chinese text</h2>
   <p>Optional: a Chinese text patch's folder (the one holding <code>data\local\lng\chi</code>,
      with <code>string.tbl</code>, <code>expansionstring.tbl</code>, <code>patchstring.tbl</code>).
      It's remembered on this device. 選擇中文補丁資料夾（只需一次）。</p>
-  <label class="button">Choose Chinese patch 選擇中文補丁<input id="pick-chinese" type="file" webkitdirectory multiple></label>
+  <label class="button">Choose Chinese patch folder 選擇中文補丁資料夾<input id="pick-chinese" type="file" webkitdirectory multiple></label>
+  <label class="button">Choose .tbl files 選擇 .tbl 檔案<input id="pick-chinese-files" type="file" multiple></label>
+  <p><small>Phones can't pick folders: choose the three <code>.tbl</code> files from one version's
+     <code>data\local\lng\chi</code> instead. 手機無法選資料夾：請改選同一個版本
+     <code>data\LOCAL\lng\chi</code> 裡的三個 .tbl 檔
+     （string.tbl、expansionstring.tbl、patchstring.tbl）。</small></p>
   <label><input id="use-chinese" type="checkbox" disabled> 使用中文 Use Chinese</label>
   <div id="chinese-status"><small>No Chinese patch yet. 尚未選擇中文補丁。</small></div>
   <div id="status"></div>
@@ -164,9 +169,10 @@ for (const id of ["pick-dir", "pick-files"])
   document.getElementById(id).addEventListener("change", (event) =>
     start(event.target.files).catch((error) => { document.body.classList.remove("playing"); status(String(error)); }));
 
-document.getElementById("pick-chinese").addEventListener("change", (event) =>
-  storeTables(event.target.files).then(() => { localStorage.removeItem("d2d-language"); return showChinese(); })
-    .catch((error) => { document.getElementById("chinese-status").textContent = String(error.message || error); }));
+for (const id of ["pick-chinese", "pick-chinese-files"])
+  document.getElementById(id).addEventListener("change", (event) =>
+    storeTables(event.target.files).then(() => { localStorage.removeItem("d2d-language"); return showChinese(); })
+      .catch((error) => { document.getElementById("chinese-status").textContent = String(error.message || error); }));
 document.getElementById("use-chinese").addEventListener("change", (event) =>
   localStorage.setItem("d2d-language", event.target.checked ? "CHI" : "ENG"));
 showChinese().catch(() => {});
