@@ -9,7 +9,9 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <title>D2Decomp</title>
 <style>
   :root { color-scheme: dark; }
@@ -47,6 +49,7 @@
   <div id="status"></div>
 </div>
 <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+<script src="touch.js"></script>
 <script>
 "use strict";
 const status = (text) => { document.getElementById("status").textContent = text; };
@@ -152,6 +155,8 @@ async function start(fileList) {
 
   document.body.classList.add("playing");
   document.getElementById("canvas").focus();
+  // Phones and tablets: buttons for the keys and the right button.
+  if (D2dTouch.isTouchDevice()) D2dTouch.attach(document.getElementById("canvas"));
   module.callMain(args);
 }
 

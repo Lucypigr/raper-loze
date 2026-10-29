@@ -280,7 +280,7 @@ if(EMSCRIPTEN)
         -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 -sFORCE_FILESYSTEM -lidbfs.js
         -sEXPORTED_RUNTIME_METHODS=callMain,FS,IDBFS,ENV
         -sENVIRONMENT=web,worker -sMODULARIZE -sEXPORT_NAME=createD2d)
-    foreach(file index.html coi-serviceworker.js)
+    foreach(file index.html coi-serviceworker.js touch.js)
         add_custom_command(TARGET d2d POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_CURRENT_SOURCE_DIR}/web/${file}" "$<TARGET_FILE_DIR:d2d>/${file}")

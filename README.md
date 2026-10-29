@@ -109,6 +109,10 @@ Actions). The page asks for your own MPQs, which stay on your device and are
 read into memory (about 2 GB), so a desktop browser is the target; phones may
 run out of memory. Saves persist in the browser's IndexedDB. Joining a game
 over TCP/IP is not available in a browser.
+On a phone or tablet (a finger as the main pointer), in landscape, buttons
+beside the picture press the keys (belt, inventory, map...), a Skill toggle
+makes taps right-clicks, and a keyboard button types names and chat; a
+desktop browser gets none of it (`apps/d2d/web/touch.js`).
 
 ## Chinese text (experimental)
 
