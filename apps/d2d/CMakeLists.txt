@@ -3,14 +3,24 @@
 # devctl + screenshot still wired to the same in-memory buffer.
 find_package(SDL3 CONFIG REQUIRED)
 # Sound: OpenAL (openal-soft), like ../thirdeye. cmake/FindOpenAL.cmake.
-find_package(OpenAL REQUIRED)
+# Emscripten's own OpenAL (over Web Audio) needs only -lopenal.
+if(EMSCRIPTEN)
+    set(OPENAL_LIBRARY openal)
+    set(OPENAL_INCLUDE_DIR "")
+else()
+    find_package(OpenAL REQUIRED)
+endif()
 
 # Crash reports: Sentry Native with its Crashpad handler, built here from
 # source, or (the Flatpak) prebuilt as its own module, which flatpak-builder
 # then caches between builds; that module installs the licenses itself.
 set(D2D_SENTRY_PREFIX "" CACHE PATH
     "Use the static crashpad Sentry Native installed here instead of building it (Flatpak)")
-if(D2D_SENTRY_PREFIX)
+if(EMSCRIPTEN)
+    # No Crashpad in a browser: web/sentry.h stands in, reporting nothing.
+    add_library(sentry INTERFACE)
+    target_include_directories(sentry INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/web")
+elseif(D2D_SENTRY_PREFIX)
     if(NOT D2D_FLATPAK)
         message(FATAL_ERROR "D2D_SENTRY_PREFIX is for the Flatpak: the packages ship crashpad_handler from this build")
     endif()
@@ -116,6 +126,11 @@ if(D2D_BUNDLED_FFMPEG)
         --enable-static --disable-shared --enable-pic
         --disable-x86asm   # no nasm needed; Bink at 640x480 is cheap in C
         --enable-demuxer=bink --enable-decoder=bink,binkaudio_rdft,binkaudio_dct)
+    if(EMSCRIPTEN)   # cross-built with emcc; -pthread as d2d's shared memory needs
+        list(APPEND ffmpeg_options
+            --enable-cross-compile --target-os=none --arch=x86_32 --disable-asm --disable-stripping
+            --cc=emcc --cxx=em++ --ar=emar --ranlib=emranlib --nm=emnm --extra-cflags=-pthread)
+    endif()
     # Named for its version and options, and built only when that build isn't
     # already there: CI caches build/ffmpeg-* (most of the ~25 s is configure).
     string(SHA1 ffmpeg_key "${D2D_FFMPEG_VERSION};${ffmpeg_options}")
@@ -239,4 +254,26 @@ d2d_check_headers(d2d_headers LINK
     SDL3::SDL3 CLI11::CLI11 ${OPENAL_LIBRARY})
 if(TARGET d2d_headers)
     target_include_directories(d2d_headers SYSTEM PRIVATE ${OPENAL_INCLUDE_DIR})
+endif()
+
+# The browser build: d2d.js + d2d.wasm beside web/index.html, which takes
+# the player's own MPQs into /d2 and calls main. SDL_Delay at each frame's
+# end yields to the browser through Asyncify, so the loop stays as it is.
+# The worker threads (scene loading, level building, music) are Web Workers
+# and need a cross-origin isolated page (COOP/COEP; index.html's service
+# worker supplies them on hosts like GitHub Pages that can't set headers).
+# Saves and d2d.cfg live in IndexedDB, mounted at /save.
+if(EMSCRIPTEN)
+    target_link_options(d2d PRIVATE
+        -sASYNCIFY -sASYNCIFY_STACK_SIZE=262144
+        -sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency+8 -sDEFAULT_PTHREAD_STACK_SIZE=2MB
+        -sSTACK_SIZE=16MB -sINITIAL_MEMORY=512MB -sALLOW_MEMORY_GROWTH -sMAXIMUM_MEMORY=4GB
+        -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 -sFORCE_FILESYSTEM -lidbfs.js
+        -sEXPORTED_RUNTIME_METHODS=callMain,FS,IDBFS,ENV
+        -sENVIRONMENT=web,worker -sMODULARIZE -sEXPORT_NAME=createD2d)
+    foreach(file index.html coi-serviceworker.js)
+        add_custom_command(TARGET d2d POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/web/${file}" "$<TARGET_FILE_DIR:d2d>/${file}")
+    endforeach()
 endif()

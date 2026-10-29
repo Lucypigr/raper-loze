@@ -1,0 +1,103 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- D2Decomp in the browser: the player picks their own Diablo II MPQs, which
+     go into the in-memory /d2 folder; d2d then runs with --data /d2. Nothing
+     is uploaded anywhere. Saves and d2d.cfg persist in IndexedDB (/save). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>D2Decomp</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; color: #c7b377; font: 15px/1.5 system-ui, sans-serif; }
+  #setup { max-width: 560px; margin: 0 auto; padding: 32px 16px; }
+  h1 { font-weight: 600; letter-spacing: .04em; }
+  label.button { display: inline-block; margin: 8px 8px 0 0; padding: 10px 16px; border: 1px solid #c7b377; border-radius: 6px; cursor: pointer; }
+  label.button:hover { background: #2a2416; }
+  input[type=file] { display: none; }
+  #status { margin-top: 16px; white-space: pre-wrap; color: #ddd; }
+  #canvas { display: none; width: 100vw; height: 100vh; object-fit: contain; touch-action: none; }
+  body.playing #setup { display: none; }
+  body.playing #canvas { display: block; }
+  small { color: #999; }
+</style>
+</head>
+<body>
+<div id="setup">
+  <h1>D2Decomp</h1>
+  <p>Choose your own Diablo II + Lord of Destruction game data: the folder holding
+     <code>d2data.mpq</code>, or the <code>.mpq</code> files themselves.
+     The files stay on this device; nothing is uploaded.</p>
+  <label class="button">Choose folder<input id="pick-dir" type="file" webkitdirectory multiple></label>
+  <label class="button">Choose .mpq files<input id="pick-files" type="file" accept=".mpq,.MPQ" multiple></label>
+  <p><small>Needed: d2data, d2exp, d2char, d2sfx, d2speech, d2music, d2xmusic, d2xtalk,
+     d2video, d2xvideo and patch_d2 (.mpq). About 2 GB of memory is used.</small></p>
+  <div id="status"></div>
+</div>
+<canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+<script>
+"use strict";
+const status = (text) => { document.getElementById("status").textContent = text; };
+
+// Threads need a cross-origin isolated page: install the header-adding
+// service worker and reload once it's in control.
+async function ensureIsolated() {
+  if (window.crossOriginIsolated) return true;
+  if (!("serviceWorker" in navigator)) return false;
+  const registration = await navigator.serviceWorker.register("coi-serviceworker.js");
+  if (!navigator.serviceWorker.controller && !sessionStorage.getItem("coi-reloaded")) {
+    sessionStorage.setItem("coi-reloaded", "1");
+    await navigator.serviceWorker.ready;
+    location.reload();
+  }
+  return registration && window.crossOriginIsolated;
+}
+
+async function start(fileList) {
+  const files = [...fileList].filter((file) => /\.mpq$/i.test(file.name));
+  if (!files.some((file) => file.name.toLowerCase() === "d2data.mpq")) {
+    status("d2data.mpq isn't among the chosen files.");
+    return;
+  }
+  status("Starting the engine…");
+  const module = await createD2d({
+    canvas: document.getElementById("canvas"),
+    print: (text) => console.log(text),
+    printErr: (text) => console.warn(text),
+    // Before the C runtime reads its environment: ~/.config is /save.
+    preRun: [(module) => { module.ENV.XDG_CONFIG_HOME = "/save"; }],
+  });
+  const FS = module.FS;
+  FS.mkdir("/d2");
+  let loaded = 0;
+  for (const file of files) {
+    status(`Reading ${file.name} (${++loaded}/${files.length})…`);
+    const data = new Uint8Array(await file.arrayBuffer());
+    FS.writeFile("/d2/" + file.name.toLowerCase(), data, { canOwn: true });
+  }
+  // Saves and settings: IndexedDB at /save, written back every few seconds.
+  FS.mkdir("/save");
+  FS.mount(module.IDBFS, {}, "/save");
+  await new Promise((resolve) => FS.syncfs(true, resolve));
+  setInterval(() => FS.syncfs(false, () => {}), 5000);
+  addEventListener("pagehide", () => FS.syncfs(false, () => {}));
+
+  document.body.classList.add("playing");
+  document.getElementById("canvas").focus();
+  module.callMain(["--data", "/d2"]);
+}
+
+for (const id of ["pick-dir", "pick-files"])
+  document.getElementById(id).addEventListener("change", (event) =>
+    start(event.target.files).catch((error) => { document.body.classList.remove("playing"); status(String(error)); }));
+
+ensureIsolated().then((isolated) => {
+  if (!isolated) status("This browser can't give the page shared memory (cross-origin isolation); d2d needs it for its threads.");
+  const script = document.createElement("script");
+  script.src = "d2d.js";
+  document.body.append(script);
+});
+</script>
+</body>
+</html>

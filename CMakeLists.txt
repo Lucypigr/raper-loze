@@ -60,6 +60,15 @@ endif()
 if(NOT WIN32)
     add_compile_options("SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/cmake/no_near_far.hpp")
 endif()
+# The browser build runs d2d's worker threads as Web Workers: every object,
+# StormLib's and the prebuilt SDL3 / zlib / bzip2 too, needs -pthread.
+# C++ exceptions are off by default there; d2d catches them (bad MPQs,
+# CLI11), so turn on Emscripten's JS-based ones: Asyncify, which keeps the
+# main loop as it is, doesn't take native wasm exceptions.
+if(EMSCRIPTEN)
+    add_compile_options(-pthread -fexceptions)
+    add_link_options(-pthread -fexceptions)
+endif()
 
 # Structs here lean on default member initializers and are aggregate-
 # initialized with only their leading fields ({ x, y, ... }); -Wextra's

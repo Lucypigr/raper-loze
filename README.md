@@ -100,6 +100,16 @@ launcher at it (a D2 install folder or the ISOs).
 Text boxes (character name, TCP/IP address, chat) open Steam's on-screen
 keyboard in Gaming Mode; if one doesn't, press STEAM + X.
 
+## Browser (experimental)
+
+d2d also builds to WebAssembly: `apps/d2d/web/build.sh` (with an activated
+Emscripten SDK) writes a static site to `build-web/apps/d2d`, and the `Web`
+workflow publishes it to GitHub Pages (Settings → Pages → Source: GitHub
+Actions). The page asks for your own MPQs, which stay on your device and are
+read into memory (about 2 GB), so a desktop browser is the target; phones may
+run out of memory. Saves persist in the browser's IndexedDB. Joining a game
+over TCP/IP is not available in a browser.
+
 ## Build and run
 
 You'll need a C++26 compiler, CMake 3.28+, Ninja, SDL3, OpenAL, zlib, libcurl

@@ -7,6 +7,12 @@ if(NOT APPLE)
     set(CMAKE_INSTALL_BINDIR ".")
 endif()
 set(QT_DEPLOY_FORCE_ADJUST_RPATHS OFF)
+# The browser build (Emscripten) is d2d alone: no Qt launcher, no proxy,
+# no packages; web/ holds its page.
+if(EMSCRIPTEN)
+    add_subdirectory(d2d)
+    return()
+endif()
 add_subdirectory(launcher)
 add_subdirectory(d2d)
 if(NOT D2D_FLATPAK)
