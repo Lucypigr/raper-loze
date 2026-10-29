@@ -21,6 +21,7 @@
 #include <shrines.hpp>
 #include <skills.hpp>
 #include <sound_ids.hpp>
+#include <tbl.hpp>
 #include <txt.hpp>
 
 #include <algorithm>
@@ -34,6 +35,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <iterator>
 #include <memory>
 #include <optional>

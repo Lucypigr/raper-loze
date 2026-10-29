@@ -170,14 +170,14 @@ inline void append_char(std::string& text, char16_t code) {
     text.push_back(char(0x80 | (code & 0x3F)));
 }
 
-// The character at `at`, stepping past it. A kWide cut short reads as 0.
-inline char16_t next_char(std::string_view text, std::size_t& at) {
-    const auto lead = static_cast<unsigned char>(text[at++]);
+// The character at `offset`, stepping past it. A kWide cut short reads as 0.
+inline char16_t next_char(std::string_view text, std::size_t& offset) {
+    const auto lead = static_cast<unsigned char>(text[offset++]);
     if (lead != static_cast<unsigned char>(kWide)) return lead;
-    if (at + 3 > text.size()) { at = text.size(); return 0; }
-    const auto byte = [&](std::size_t i) { return char16_t(static_cast<unsigned char>(text[at + i]) & 0x3F); };
-    const auto code = char16_t((byte(0) << 12) | (byte(1) << 6) | byte(2));
-    at += 3;
+    if (offset + 3 > text.size()) { offset = text.size(); return 0; }
+    const auto bits = [&](std::size_t index) { return char16_t(static_cast<unsigned char>(text[offset + index]) & 0x3F); };
+    const auto code = char16_t((bits(0) << 12) | (bits(1) << 6) | bits(2));
+    offset += 3;
     return code;
 }
 
