@@ -91,6 +91,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#ifdef __EMSCRIPTEN__
+#include <emscripten/wasmfs.h>
+#endif
 
 using namespace d2d::client;
 
@@ -1601,6 +1604,12 @@ extern "C" void d2d_sigint_handler(int) {
 }
 
 int main(int argc, char** argv) {
+#ifdef __EMSCRIPTEN__
+    // The browser build: /opfs is the page's origin-private file system,
+    // where web/index.html stored the player's MPQs (/opfs/d2) and where
+    // saves and d2d.cfg live (/opfs/save): read from disk, not memory.
+    wasmfs_create_directory("/opfs", 0777, wasmfs_create_opfs_backend());
+#endif
     // Ctrl-C and SIGTERM set the loop-quit flag instead of terminating
     // mid-frame. SIGPIPE gets ignored so a closed devctl client doesn't
     // kill the game.

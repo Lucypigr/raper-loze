@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Builds d2d for the browser into build-web/apps/d2d (index.html, d2d.js,
-# d2d.wasm, coi-serviceworker.js, touch.js): a folder any static host can serve.
+# d2d.wasm, coi-serviceworker.js, touch.js, opfs-writer.js): a folder any
+# static host can serve.
 #
 # Needs an activated Emscripten SDK (source emsdk_env.sh), git, cmake and
 # ninja. SDL3, zlib and bzip2 are built here with -pthread, as d2d's
@@ -48,4 +49,4 @@ emcmake cmake -S "$root" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH="$prefix" -DCMAKE_FIND_ROOT_PATH="$prefix" -DSDL3_DIR="$prefix/lib/cmake/SDL3" \
     -DD2D_BUILD_TOOLS=OFF -DD2D_BUILD_TESTS=OFF -DBUILD_TESTING=OFF
 cmake --build "$build" --target d2d
-echo "Built: $build/apps/d2d (index.html, d2d.js, d2d.wasm, coi-serviceworker.js, touch.js)"
+echo "Built: $build/apps/d2d (index.html, d2d.js, d2d.wasm, coi-serviceworker.js, touch.js, opfs-writer.js)"

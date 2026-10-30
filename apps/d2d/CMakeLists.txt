@@ -265,22 +265,24 @@ if(TARGET d2d_headers)
     target_include_directories(d2d_headers SYSTEM PRIVATE ${OPENAL_INCLUDE_DIR})
 endif()
 
-# The browser build: d2d.js + d2d.wasm beside web/index.html, which takes
-# the player's own MPQs into /d2 and calls main. SDL_Delay at each frame's
-# end yields to the browser through Asyncify, so the loop stays as it is.
-# The worker threads (scene loading, level building, music) are Web Workers
-# and need a cross-origin isolated page (COOP/COEP; index.html's service
-# worker supplies them on hosts like GitHub Pages that can't set headers).
-# Saves and d2d.cfg live in IndexedDB, mounted at /save.
+# The browser build: d2d.js + d2d.wasm beside web/index.html, which stores
+# the player's own MPQs in the origin-private file system (OPFS), mounted at
+# /opfs through WasmFS: read from disk as the game wants them, not held in
+# memory (a phone's tab can't hold 2 GB). Saves and d2d.cfg live there too.
+# SDL_Delay at each frame's end yields to the browser through Asyncify, so
+# the loop stays as it is. The worker threads (scene loading, level
+# building, music, OPFS) are Web Workers and need a cross-origin isolated
+# page (COOP/COEP; index.html's service worker supplies them on hosts like
+# GitHub Pages that can't set headers).
 if(EMSCRIPTEN)
     target_link_options(d2d PRIVATE
-        -sASYNCIFY -sASYNCIFY_STACK_SIZE=262144
+        -sWASMFS -sASYNCIFY -sASYNCIFY_STACK_SIZE=262144
         -sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency+8 -sDEFAULT_PTHREAD_STACK_SIZE=2MB
-        -sSTACK_SIZE=16MB -sINITIAL_MEMORY=512MB -sALLOW_MEMORY_GROWTH -sMAXIMUM_MEMORY=4GB
-        -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 -sFORCE_FILESYSTEM -lidbfs.js
-        -sEXPORTED_RUNTIME_METHODS=callMain,FS,IDBFS,ENV
+        -sSTACK_SIZE=16MB -sINITIAL_MEMORY=256MB -sALLOW_MEMORY_GROWTH -sMAXIMUM_MEMORY=2GB
+        -sINVOKE_RUN=0 -sEXIT_RUNTIME=0
+        -sEXPORTED_RUNTIME_METHODS=callMain,ENV
         -sENVIRONMENT=web,worker -sMODULARIZE -sEXPORT_NAME=createD2d)
-    foreach(file index.html coi-serviceworker.js touch.js)
+    foreach(file index.html coi-serviceworker.js touch.js opfs-writer.js)
         add_custom_command(TARGET d2d POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_CURRENT_SOURCE_DIR}/web/${file}" "$<TARGET_FILE_DIR:d2d>/${file}")

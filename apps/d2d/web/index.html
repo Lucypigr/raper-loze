@@ -1,11 +1,13 @@
 <!doctype html>
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <!-- D2Decomp in the browser: the player picks their own Diablo II MPQs, which
-     go into the in-memory /d2 folder; d2d then runs with --data /d2. Nothing
-     is uploaded anywhere. Saves and d2d.cfg persist in IndexedDB (/save).
-     Optionally a Chinese text patch's string tables (lng\chi\*.tbl): kept in
-     IndexedDB (d2d-chinese), copied to /d2/data/local/lng/chi, and d2d runs with
-     --language CHI (their characters draw in the built-in Cubic 11). -->
+     opfs-writer.js copies into this origin's private file system (OPFS) under
+     d2/; d2d mounts it at /opfs (WasmFS) and runs with --data /opfs/d2, reading
+     from disk rather than memory. Nothing is uploaded anywhere, and the files
+     stay for the next visit; saves and d2d.cfg live in /opfs/save. Optionally a
+     Chinese text patch's string tables (lng\chi\*.tbl) go to
+     d2/data/local/lng/chi, and d2d runs with --language CHI (their characters
+     draw in the built-in Cubic 11). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -19,7 +21,11 @@
   #setup { max-width: 560px; margin: 0 auto; padding: 32px 16px; }
   h1 { font-weight: 600; letter-spacing: .04em; }
   label.button { display: inline-block; margin: 8px 8px 0 0; padding: 10px 16px; border: 1px solid #c7b377; border-radius: 6px; cursor: pointer; }
-  label.button:hover { background: #2a2416; }
+  label.button:hover, button.button:hover { background: #2a2416; }
+  button.button { margin: 8px 8px 0 0; padding: 10px 16px; border: 1px solid #c7b377; border-radius: 6px; background: none;
+                  color: inherit; font: inherit; cursor: pointer; }
+  button.play { font-weight: 700; font-size: 17px; background: #3a2c10; }
+  button.button:disabled { opacity: .4; cursor: default; }
   input[type=file] { display: none; }
   #status { margin-top: 16px; white-space: pre-wrap; color: #ddd; }
   h2 { font-size: 17px; font-weight: 600; margin-top: 28px; }
@@ -34,11 +40,16 @@
   <h1>D2Decomp</h1>
   <p>Choose your own Diablo II + Lord of Destruction game data: the folder holding
      <code>d2data.mpq</code>, or the <code>.mpq</code> files themselves.
-     The files stay on this device; nothing is uploaded.</p>
-  <label class="button">Choose folder<input id="pick-dir" type="file" webkitdirectory multiple></label>
-  <label class="button">Choose .mpq files<input id="pick-files" type="file" multiple></label>
-  <p><small>Needed: d2data, d2exp, d2char, d2sfx, d2speech, d2music, d2xmusic, d2xtalk,
-     d2video, d2xvideo and patch_d2 (.mpq). About 2 GB of memory is used.</small></p>
+     They're copied into this browser's storage on this device (nothing is uploaded),
+     once: next time, just press Play. 遊戲資料只需選一次，會存在這台裝置的瀏覽器裡。</p>
+  <label class="button">Choose folder 選資料夾<input id="pick-dir" type="file" webkitdirectory multiple></label>
+  <label class="button">Choose .mpq files 選 .mpq 檔<input id="pick-files" type="file" multiple></label>
+  <p><small>Needed: d2data, d2exp, d2char and patch_d2 (.mpq). For sound, music and the
+     cinematics also d2sfx, d2speech, d2xtalk, d2music, d2xmusic, d2video and d2xvideo.
+     必要：d2data、d2exp、d2char、patch_d2；其餘是音效、音樂和動畫。</small></p>
+  <div id="stored"></div>
+  <button id="play" class="button play" disabled>Play 開始遊戲</button>
+  <button id="clear" class="button" disabled>Clear stored data 清除已存資料</button>
   <h2>中文 Chinese text</h2>
   <p>Optional: a Chinese text patch's folder (the one holding <code>data\local\lng\chi</code>,
      with <code>string.tbl</code>, <code>expansionstring.tbl</code>, <code>patchstring.tbl</code>).
@@ -73,91 +84,98 @@ async function ensureIsolated() {
   return registration && window.crossOriginIsolated;
 }
 
-// The Chinese patch's tables, kept in this device's IndexedDB (the same
-// database d2d's saves are in, opened here before the engine starts).
+// The origin-private file system: the MPQs in d2/, the Chinese tables in
+// d2/data/local/lng/chi (d2d's loose-table folder), d2d's saves in save/.
 const kTables = ["string.tbl", "expansionstring.tbl", "patchstring.tbl"];
-const tableStore = () => new Promise((resolve, reject) => {
-  const request = indexedDB.open("d2d-chinese", 1);
-  request.onupgradeneeded = () => request.result.createObjectStore("tables");
-  request.onsuccess = () => resolve(request.result);
-  request.onerror = () => reject(request.error);
-});
-async function storedTables() {
-  const db = await tableStore();
-  return new Promise((resolve) => {
-    const tables = {};
-    const store = db.transaction("tables").objectStore("tables");
-    let left = kTables.length;
-    for (const name of kTables) {
-      const request = store.get(name);
-      request.onsuccess = () => { if (request.result) tables[name] = request.result; if (--left === 0) resolve(tables); };
-      request.onerror = () => { if (--left === 0) resolve(tables); };
-    }
-  });
+const kNeeded = ["d2data.mpq", "d2exp.mpq", "d2char.mpq"];
+const kChineseDir = ["d2", "data", "local", "lng", "chi"];
+async function folder(parts, create = false) {
+  let directory = await navigator.storage.getDirectory();
+  for (const part of parts) directory = await directory.getDirectoryHandle(part, { create });
+  return directory;
 }
+// {name: size} of the files in a stored folder ({} when there's none).
+async function storedFiles(parts) {
+  const files = {};
+  try {
+    for await (const [name, handle] of (await folder(parts)).entries())
+      if (handle.kind === "file") files[name] = (await handle.getFile()).size;
+  } catch { /* no such folder yet */ }
+  return files;
+}
+
+// Copies files into OPFS through opfs-writer.js, 8 MB at a time.
+let writer = null;
+function store(entries, progress) {
+  writer ??= new Worker("opfs-writer.js");
+  return entries.reduce((previous, [path, file]) => previous.then(() => new Promise((resolve, reject) => {
+    writer.onmessage = ({ data }) => {
+      if (data.error) reject(new Error(`${path}: ${data.error}`));
+      else if (data.done) resolve();
+      else progress(path, data.written, data.size);
+    };
+    writer.postMessage({ path, file });
+  })), Promise.resolve());
+}
+
+async function show() {
+  const mpqs = await storedFiles(["d2"]);
+  const names = Object.keys(mpqs).filter((name) => /\.mpq$/i.test(name)).sort();
+  const total = names.reduce((sum, name) => sum + mpqs[name], 0);
+  const missing = kNeeded.filter((name) => !names.includes(name));
+  document.getElementById("stored").innerHTML = names.length
+    ? `<small>Stored 已存: ${names.join(", ")} (${(total / 1e9).toFixed(2)} GB)` +
+      (missing.length ? `<br>Still needed 還缺: ${missing.join(", ")}` : "") + "</small>"
+    : "<small>No game data stored yet. 尚未存入遊戲資料。</small>";
+  document.getElementById("play").disabled = missing.length > 0;
+  document.getElementById("clear").disabled = names.length === 0;
+
+  const tables = Object.keys(await storedFiles(kChineseDir));
+  const box = document.getElementById("use-chinese");
+  box.disabled = tables.length === 0;
+  box.checked = tables.length > 0 && localStorage.getItem("d2d-language") !== "ENG";
+  document.getElementById("chinese-status").innerHTML = tables.length
+    ? `<small>Chinese patch ready 中文補丁已就緒: ${tables.join(", ")}</small>`
+    : "<small>No Chinese patch yet. 尚未選擇中文補丁。</small>";
+}
+
+async function storeMpqs(fileList) {
+  const files = [...fileList].filter((file) => /\.mpq$/i.test(file.name));
+  if (!files.length) throw new Error("No .mpq files among the chosen ones. 沒有選到 .mpq 檔。");
+  navigator.storage.persist?.().catch(() => {});   // keep them through storage pressure
+  const total = files.reduce((sum, file) => sum + file.size, 0);
+  let before = 0;
+  await store(files.map((file) => ["d2/" + file.name.toLowerCase(), file]), (path, written) => {
+    status(`Storing 存入中 ${path.slice(3)}… ${Math.floor((before + written) / total * 100)}%`);
+    if (written === files.find((file) => "d2/" + file.name.toLowerCase() === path).size) before += written;
+  });
+  status("Stored. 已存入。");
+}
+
 async function storeTables(fileList) {
   // The lng/chi tables (a patch folder may hold other languages' too).
   const files = [...fileList].filter((file) => kTables.includes(file.name.toLowerCase()));
   const chinese = files.filter((file) => /(^|\/)chi\//i.test(file.webkitRelativePath));
   const picked = chinese.length ? chinese : files;
-  if (!picked.length) throw new Error("No string.tbl / expansionstring.tbl / patchstring.tbl in that folder. 資料夾裡找不到 .tbl 檔。");
+  if (!picked.length) throw new Error("No string.tbl / expansionstring.tbl / patchstring.tbl among them. 找不到 .tbl 檔。");
   if (new Set(picked.map((file) => file.name.toLowerCase())).size < picked.length)
     throw new Error("That folder holds several versions of the patch: choose one of them. 這個資料夾裡有好幾個版本，請只選其中一個版本的資料夾。");
-  // Read first: a transaction ends at the first await that isn't its own.
-  const tables = await Promise.all(picked.map(async (file) => [file.name.toLowerCase(), new Uint8Array(await file.arrayBuffer())]));
-  const db = await tableStore();
-  const transaction = db.transaction("tables", "readwrite");
-  const store = transaction.objectStore("tables");
-  store.clear();   // one version's tables, never mixed with another's
-  for (const [name, data] of tables) store.put(data, name);
-  await new Promise((resolve, reject) => { transaction.oncomplete = resolve; transaction.onerror = () => reject(transaction.error); });
-}
-async function showChinese() {
-  const names = Object.keys(await storedTables());
-  const box = document.getElementById("use-chinese");
-  box.disabled = names.length === 0;
-  box.checked = names.length > 0 && localStorage.getItem("d2d-language") !== "ENG";
-  document.getElementById("chinese-status").innerHTML = names.length
-    ? `<small>Chinese patch ready 中文補丁已就緒: ${names.join(", ")}</small>`
-    : "<small>No Chinese patch yet. 尚未選擇中文補丁。</small>";
+  // One version's tables, never mixed with another's.
+  for (const name of Object.keys(await storedFiles(kChineseDir))) await (await folder(kChineseDir)).removeEntry(name);
+  await store(picked.map((file) => [kChineseDir.join("/") + "/" + file.name.toLowerCase(), file]), () => {});
 }
 
-async function start(fileList) {
-  const files = [...fileList].filter((file) => /\.mpq$/i.test(file.name));
-  if (!files.some((file) => file.name.toLowerCase() === "d2data.mpq")) {
-    status("d2data.mpq isn't among the chosen files.");
-    return;
-  }
-  status("Starting the engine…");
+async function play() {
+  status("Starting the engine… 啟動中…");
   const module = await createD2d({
     canvas: document.getElementById("canvas"),
     print: (text) => console.log(text),
     printErr: (text) => console.warn(text),
-    // Before the C runtime reads its environment: ~/.config is /save.
-    preRun: [(module) => { module.ENV.XDG_CONFIG_HOME = "/save"; }],
+    // Before the C runtime reads its environment: ~/.config is /opfs/save.
+    preRun: [(module) => { module.ENV.XDG_CONFIG_HOME = "/opfs/save"; }],
   });
-  const FS = module.FS;
-  FS.mkdir("/d2");
-  let loaded = 0;
-  for (const file of files) {
-    status(`Reading ${file.name} (${++loaded}/${files.length})…`);
-    const data = new Uint8Array(await file.arrayBuffer());
-    FS.writeFile("/d2/" + file.name.toLowerCase(), data, { canOwn: true });
-  }
-  const args = ["--data", "/d2"];
-  if (document.getElementById("use-chinese").checked) {
-    const tables = await storedTables();
-    FS.mkdirTree("/d2/data/local/lng/chi");
-    for (const [name, data] of Object.entries(tables)) FS.writeFile("/d2/data/local/lng/chi/" + name, data);
-    args.push("--language", "CHI");
-  }
-  // Saves and settings: IndexedDB at /save, written back every few seconds.
-  FS.mkdir("/save");
-  FS.mount(module.IDBFS, {}, "/save");
-  await new Promise((resolve) => FS.syncfs(true, resolve));
-  setInterval(() => FS.syncfs(false, () => {}), 5000);
-  addEventListener("pagehide", () => FS.syncfs(false, () => {}));
-
+  const args = ["--data", "/opfs/d2"];
+  if (document.getElementById("use-chinese").checked) args.push("--language", "CHI");
   document.body.classList.add("playing");
   document.getElementById("canvas").focus();
   // Phones and tablets: buttons for the keys and the right button.
@@ -165,17 +183,24 @@ async function start(fileList) {
   module.callMain(args);
 }
 
+const failed = (error) => { document.body.classList.remove("playing"); status(String(error.message || error)); };
 for (const id of ["pick-dir", "pick-files"])
-  document.getElementById(id).addEventListener("change", (event) =>
-    start(event.target.files).catch((error) => { document.body.classList.remove("playing"); status(String(error)); }));
-
+  document.getElementById(id).addEventListener("change", (event) => storeMpqs(event.target.files).then(show).catch(failed));
 for (const id of ["pick-chinese", "pick-chinese-files"])
   document.getElementById(id).addEventListener("change", (event) =>
-    storeTables(event.target.files).then(() => { localStorage.removeItem("d2d-language"); return showChinese(); })
+    storeTables(event.target.files).then(() => { localStorage.removeItem("d2d-language"); return show(); })
       .catch((error) => { document.getElementById("chinese-status").textContent = String(error.message || error); }));
 document.getElementById("use-chinese").addEventListener("change", (event) =>
   localStorage.setItem("d2d-language", event.target.checked ? "CHI" : "ENG"));
-showChinese().catch(() => {});
+document.getElementById("play").addEventListener("click", () => play().catch(failed));
+document.getElementById("clear").addEventListener("click", async () => {
+  if (!confirm("Remove the stored game data (MPQs and Chinese tables) from this browser? Saves stay.\n要刪除這個瀏覽器裡已存的遊戲資料嗎？存檔會保留。")) return;
+  await (await navigator.storage.getDirectory()).removeEntry("d2", { recursive: true }).catch(() => {});
+  status("Cleared. 已清除。");
+  show();
+});
+if (navigator.storage?.getDirectory) show().catch(failed);
+else status("This browser has no origin-private file system; d2d needs it to keep the game data. 這個瀏覽器不支援本機儲存空間。");
 
 ensureIsolated().then((isolated) => {
   if (!isolated) status("This browser can't give the page shared memory (cross-origin isolation); d2d needs it for its threads.");
