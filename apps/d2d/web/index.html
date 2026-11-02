@@ -27,7 +27,7 @@
   button.play { font-weight: 700; font-size: 17px; background: #3a2c10; }
   button.button:disabled { opacity: .4; cursor: default; }
   input[type=file] { display: none; }
-  #status { margin-top: 16px; white-space: pre-wrap; color: #ddd; }
+  #status, #chinese-status { margin-top: 16px; white-space: pre-wrap; color: #ddd; }
   h2 { font-size: 17px; font-weight: 600; margin-top: 28px; }
   #canvas { display: none; width: 100vw; height: 100vh; object-fit: contain; touch-action: none; }
   body.playing #setup { display: none; }
@@ -183,13 +183,22 @@ async function play() {
   module.callMain(args);
 }
 
-const failed = (error) => { document.body.classList.remove("playing"); status(String(error.message || error)); };
+// Safari's private browsing gives a page next to no storage, and says so
+// as an "unknown transient reason (e.g. out of memory)".
+const storageHint = (error) => {
+  const text = String(error.message || error);
+  return /transient|quota|memory|NotAllowed|SecurityError/i.test(text)
+    ? text + "\n\nPrivate browsing has almost no storage for pages: open this page in a normal tab, and keep some space free on the device. " +
+      "私密瀏覽幾乎不給網頁儲存空間：請改用一般（非私密）分頁開啟，並確認裝置還有足夠空間。"
+    : text;
+};
+const failed = (error) => { document.body.classList.remove("playing"); status(storageHint(error)); };
 for (const id of ["pick-dir", "pick-files"])
   document.getElementById(id).addEventListener("change", (event) => storeMpqs(event.target.files).then(show).catch(failed));
 for (const id of ["pick-chinese", "pick-chinese-files"])
   document.getElementById(id).addEventListener("change", (event) =>
     storeTables(event.target.files).then(() => { localStorage.removeItem("d2d-language"); return show(); })
-      .catch((error) => { document.getElementById("chinese-status").textContent = String(error.message || error); }));
+      .catch((error) => { document.getElementById("chinese-status").textContent = storageHint(error); }));
 document.getElementById("use-chinese").addEventListener("change", (event) =>
   localStorage.setItem("d2d-language", event.target.checked ? "CHI" : "ENG"));
 document.getElementById("play").addEventListener("click", () => play().catch(failed));
