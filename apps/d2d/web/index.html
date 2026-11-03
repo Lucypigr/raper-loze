@@ -33,6 +33,7 @@
   body.playing #setup { display: none; }
   body.playing #canvas { display: block; }
   small { color: #999; }
+  #crumbs { white-space: pre-wrap; word-break: break-all; font-size: 11px; color: #bbb; background: #111; padding: 8px; border-radius: 6px; }
 </style>
 </head>
 <body>
@@ -63,12 +64,39 @@
   <label><input id="use-chinese" type="checkbox" disabled> 使用中文 Use Chinese</label>
   <div id="chinese-status"><small>No Chinese patch yet. 尚未選擇中文補丁。</small></div>
   <div id="status"></div>
+  <div id="last-run" hidden><h2>上次當掉前的紀錄 Before the last crash</h2>
+    <p><small>Please send a screenshot of this. 請截圖給開發者。</small></p><pre id="crumbs"></pre></div>
 </div>
 <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
 <script src="touch.js"></script>
 <script>
 "use strict";
 const status = (text) => { document.getElementById("status").textContent = text; };
+
+// Breadcrumbs that outlive a crash: a phone kills a tab that uses too much
+// memory, with no error to see. The last lines d2d logged, the page's own
+// steps and the wasm memory's size go to localStorage as they happen; a
+// visit after a run that never ended shows them.
+const kCrumbs = 40;
+let wasmMemory = null;
+function crumb(text) {
+  try {
+    const lines = JSON.parse(localStorage.getItem("d2d-crumbs") || "[]");
+    const mb = wasmMemory ? ` [${Math.round(wasmMemory.buffer.byteLength / 1048576)} MB]` : "";
+    lines.push(new Date().toISOString().slice(11, 19) + mb + " " + String(text).replace(/^\S+Z /, "").slice(0, 200));
+    localStorage.setItem("d2d-crumbs", JSON.stringify(lines.slice(-kCrumbs)));
+  } catch { /* storage full or blocked: the game still runs */ }
+}
+function showLastRun() {
+  try {
+    if (localStorage.getItem("d2d-running") !== "1") return;
+    document.getElementById("crumbs").textContent =
+      `${navigator.userAgent}\n` + JSON.parse(localStorage.getItem("d2d-crumbs") || "[]").join("\n");
+    document.getElementById("last-run").hidden = false;
+  } catch { /* nothing kept */ }
+}
+showLastRun();
+addEventListener("pagehide", () => { try { localStorage.setItem("d2d-running", "0"); } catch {} });
 
 // Threads need a cross-origin isolated page: install the header-adding
 // service worker and reload once it's in control.
@@ -144,12 +172,16 @@ async function storeMpqs(fileList) {
   if (!files.length) throw new Error("No .mpq files among the chosen ones. 沒有選到 .mpq 檔。");
   navigator.storage.persist?.().catch(() => {});   // keep them through storage pressure
   const total = files.reduce((sum, file) => sum + file.size, 0);
+  try { localStorage.setItem("d2d-crumbs", "[]"); localStorage.setItem("d2d-running", "1"); } catch {}
+  crumb("storing " + files.map((file) => `${file.name} ${Math.round(file.size / 1048576)}MB`).join(", "));
   let before = 0;
   await store(files.map((file) => ["d2/" + file.name.toLowerCase(), file]), (path, written) => {
     status(`Storing 存入中 ${path.slice(3)}… ${Math.floor((before + written) / total * 100)}%`);
     if (written === files.find((file) => "d2/" + file.name.toLowerCase() === path).size) before += written;
   });
   status("Stored. 已存入。");
+  crumb("stored");
+  try { localStorage.setItem("d2d-running", "0"); } catch {}
 }
 
 async function storeTables(fileList) {
@@ -167,10 +199,12 @@ async function storeTables(fileList) {
 
 async function play() {
   status("Starting the engine… 啟動中…");
+  try { localStorage.setItem("d2d-crumbs", "[]"); localStorage.setItem("d2d-running", "1"); } catch {}
+  crumb("play " + (document.getElementById("use-chinese").checked ? "CHI" : "ENG"));
   const module = await createD2d({
     canvas: document.getElementById("canvas"),
-    print: (text) => console.log(text),
-    printErr: (text) => console.warn(text),
+    print: (text) => { console.log(text); crumb(text); },
+    printErr: (text) => { console.warn(text); crumb(text); },
     // Before the C runtime reads its environment: ~/.config is /opfs/save.
     preRun: [(module) => { module.ENV.XDG_CONFIG_HOME = "/opfs/save"; }],
   });
@@ -180,6 +214,9 @@ async function play() {
   document.getElementById("canvas").focus();
   // Phones and tablets: buttons for the keys and the right button.
   if (D2dTouch.isTouchDevice()) D2dTouch.attach(document.getElementById("canvas"));
+  wasmMemory = module.wasmMemory ?? null;
+  // Every 2 s, the memory's size: the last one before a crash says how far it grew.
+  setInterval(() => crumb("memory"), 2000);
   module.callMain(args);
 }
 

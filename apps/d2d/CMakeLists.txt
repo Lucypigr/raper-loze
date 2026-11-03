@@ -280,7 +280,7 @@ if(EMSCRIPTEN)
         -sPTHREAD_POOL_SIZE=navigator.hardwareConcurrency+8 -sDEFAULT_PTHREAD_STACK_SIZE=2MB
         -sSTACK_SIZE=16MB -sINITIAL_MEMORY=256MB -sALLOW_MEMORY_GROWTH -sMAXIMUM_MEMORY=2GB
         -sINVOKE_RUN=0 -sEXIT_RUNTIME=0
-        -sEXPORTED_RUNTIME_METHODS=callMain,ENV
+        -sEXPORTED_RUNTIME_METHODS=callMain,ENV,wasmMemory
         -sENVIRONMENT=web,worker -sMODULARIZE -sEXPORT_NAME=createD2d)
     foreach(file index.html coi-serviceworker.js touch.js opfs-writer.js)
         add_custom_command(TARGET d2d POST_BUILD
